@@ -46,11 +46,23 @@ type PeerState = {
   joinedAt: number;
 };
 
-type MovePacket = { x: number; y: number; z: number; ry: number; moving: boolean };
+type GamePlayer = { state: "active" | "frozen" | "out"; x: number; y: number; z: number; stamina: number; protectedUntil: number };
+type GameState = { hostId: string; roundId: string; phase: "idle" | "playing" | "ended"; taggerId: string | null; endsAt: number; serverNow: number; result: string; players: Record<string, GamePlayer> };
+const EMPTY_GAME: GameState = { hostId: "", roundId: "", phase: "idle", taggerId: null, endsAt: 0, serverNow: 0, result: "", players: {} };
+function gameBadge(g: GameState, id: string) {
+  if (g.phase !== "playing") return "";
+  if (!g.players[id]) return "👀 관전";
+  if (id === g.taggerId) return "🔴 술래";
+  return g.players[id].state === "frozen" ? "🧊 얼음" : g.players[id].state === "out" ? "👀 탈락" : "🏃 도망자";
+}
+
+type MovePacket = { sprinting?: boolean; x: number; y: number; z: number; ry: number; moving: boolean };
 type JoinProfile = Omit<PeerState, "id" | "joinedAt">;
 type HostInfo = { ips: string[]; port: number; wsPort: number };
 
 type ClientMsg =
+  | { t: "host-transfer"; targetId: string }
+  | { t: "game-start" | "game-random" | "freeze" | "rescue" }
   | { t: "join"; room: string; profile: JoinProfile }
   | { t: "seat"; seatIndex: number | null }
   | { t: "status"; status: Status }
@@ -59,6 +71,8 @@ type ClientMsg =
   | { t: "gesture"; emoji: string };
 
 type ServerMsg =
+  | ({ t: "game" } & GameState)
+  | { t: "position"; x: number; y: number; z: number }
   | { t: "welcome"; id: string; you: PeerState; peers: PeerState[] }
   | { t: "full"; max: number }
   | { t: "peer-join"; peer: PeerState }
@@ -85,6 +99,8 @@ type AvatarRig = {
   group: THREE.Group;
   legL: THREE.Mesh;
   legR: THREE.Mesh;
+  armL: THREE.Mesh;
+  armR: THREE.Mesh;
   label: HTMLDivElement;
   labelSig: string;
   walkPhase: number;
@@ -175,13 +191,39 @@ function createRig(color: string, layer: HTMLDivElement): AvatarRig {
   const legR = new THREE.Mesh(legGeo, dark);
   legR.position.set(0.13, 0.5, 0);
 
-  [body, head, legL, legR].forEach((m) => (m.castShadow = true));
-  group.add(body, head, eyeL, eyeR, legL, legR);
+  // 어깨를 회전축으로 두어 팔 전체가 자연스럽게 흔들리게 한다.
+  const armGeo = new THREE.CapsuleGeometry(0.09, 0.32, 4, 8);
+  armGeo.translate(0, -0.23, 0);
+  const armL = new THREE.Mesh(armGeo, mat);
+  armL.position.set(-0.4, 1.12, 0);
+  const armR = new THREE.Mesh(armGeo, mat);
+  armR.position.set(0.4, 1.12, 0);
+  for (const arm of [armL, armR]) {
+    const hand = new THREE.Mesh(new THREE.SphereGeometry(0.1, 12, 8), skin);
+    hand.position.y = -0.48;
+    hand.castShadow = true;
+    arm.add(hand);
+  }
+
+  [body, head, legL, legR, armL, armR].forEach((m) => (m.castShadow = true));
+  group.add(body, head, eyeL, eyeR, legL, legR, armL, armR);
+  const ice = new THREE.Mesh(new THREE.BoxGeometry(0.95, 1.85, 0.95), new THREE.MeshStandardMaterial({ color: "#67e8f9", transparent: true, opacity: 0.45, roughness: 0.15 }));
+  ice.name = "ice";
+  ice.position.y = 0.9;
+  ice.visible = false;
+  const taggerRing = new THREE.Mesh(new THREE.TorusGeometry(0.5, 0.07, 8, 24), new THREE.MeshBasicMaterial({ color: "#fb4444" }));
+  taggerRing.name = "tagger";
+  taggerRing.rotation.x = Math.PI / 2;
+  taggerRing.position.y = 0.08;
+  taggerRing.visible = false;
+  group.add(ice, taggerRing);
 
   return {
     group,
     legL,
     legR,
+    armL,
+    armR,
     label: createLabel(layer),
     labelSig: "",
     walkPhase: 0,
@@ -190,14 +232,16 @@ function createRig(color: string, layer: HTMLDivElement): AvatarRig {
   };
 }
 
-function updateLabel(rig: AvatarRig, p: PeerState, gesture: string, isMe: boolean) {
-  const sig = `${gesture}|${p.avatar}|${p.name}|${p.status}|${p.goal}|${isMe}`;
+function updateLabel(rig: AvatarRig, p: PeerState, gesture: string, isMe: boolean, badge = "") {
+  const sig = `${gesture}|${p.avatar}|${p.name}|${p.status}|${p.goal}|${isMe}|${badge}`;
   if (sig === rig.labelSig) return;
   rig.labelSig = sig;
+  rig.group.getObjectByName("ice")!.visible = badge.includes("얼음");
+  rig.group.getObjectByName("tagger")!.visible = badge.includes("술래");
   const [g, n, goal] = Array.from(rig.label.children) as HTMLDivElement[];
   g.textContent = gesture;
   g.style.visibility = gesture ? "visible" : "hidden";
-  n.textContent = `${p.avatar} ${p.name}${isMe ? " (나)" : ""} · ${p.status === "coding" ? "💻" : "☕"}`;
+  n.textContent = `${badge ? badge + " · " : ""}${p.avatar} ${p.name}${isMe ? " (나)" : ""} · ${p.status === "coding" ? "💻" : "☕"}`;
   goal.textContent = p.goal;
   goal.style.display = p.goal ? "block" : "none";
 }
@@ -227,11 +271,17 @@ export default function Page() {
   const [seatIndex, setSeatIndex] = useState<number | null>(null);
   const [soundOn, setSoundOn] = useState(true);
   const [reconnectKey, setReconnectKey] = useState(0);
+  const [myProfile, setMyProfile] = useState<PeerState>({ id: "", name: "", goal: "", avatar: AVATARS[0], color: COLORS[0], status: "coding", seatIndex: null, joinedAt: 0 });
+  const [game, setGame] = useState<GameState>(EMPTY_GAME);
+  const [stamina, setStamina] = useState(100);
+  const gameRef = useRef<GameState>(EMPTY_GAME);
+  const staminaRef = useRef(100);
 
   // ── refs ──
   const mountRef = useRef<HTMLDivElement | null>(null);
   const labelLayerRef = useRef<HTMLDivElement | null>(null);
   const chatBoxRef = useRef<HTMLDivElement | null>(null);
+  const chatInputRef = useRef<HTMLInputElement | null>(null);
 
   const peersRef = useRef<Record<string, PeerState>>({});
   const myProfileRef = useRef<PeerState>({
@@ -317,6 +367,7 @@ export default function Page() {
 
   const trySit = useCallback(
     (idx: number) => {
+      if (gameRef.current.phase === "playing") return;
       const taken = Object.values(peersRef.current).some((p) => p.seatIndex === idx);
       if (taken) {
         addSystemMessage("이미 다른 동료가 앉아 있는 자리예요.");
@@ -337,6 +388,8 @@ export default function Page() {
       seatRef.current = null;
       setSeatIndex(null);
       setMessages([]);
+      gameRef.current = EMPTY_GAME;
+      setGame(EMPTY_GAME);
       setPhase("lobby");
     },
     [commitPeers]
@@ -349,7 +402,7 @@ export default function Page() {
 
   /* ── 1) 호스트 IP 정보 가져오기 ── */
   useEffect(() => {
-    setIsHttps(window.location.protocol === "https:");
+    queueMicrotask(() => setIsHttps(window.location.protocol === "https:"));
     let alive = true;
     fetch("/__host-info", { cache: "no-store" })
       .then((r) => {
@@ -442,8 +495,39 @@ export default function Page() {
         }
 
         switch (msg.t) {
+          case "game": {
+            const previous = gameRef.current;
+            if (previous.hostId && previous.hostId !== msg.hostId) {
+              const hostName = msg.hostId === myProfileRef.current.id ? myProfileRef.current.name : peersRef.current[msg.hostId]?.name ?? "동료";
+              addSystemMessage(`👑 ${hostName}님이 방장이 되었어요.`);
+            }
+            const player = msg.players[myProfileRef.current.id];
+            if (msg.phase === "playing" && msg.roundId !== previous.roundId) {
+              seatRef.current = null;
+              setSeatIndex(null);
+              keysRef.current.clear();
+              jumpQueuedRef.current = false;
+              if (player) Object.assign(localRef.current, { x: player.x, y: 0, z: player.z, vy: 0 });
+              staminaRef.current = 100;
+              addSystemMessage("🧊 얼음땡 시작! Shift 달리기 · F 얼음 · G 땡");
+            }
+            if (msg.phase === "playing") {
+              for (const [id, p] of Object.entries(msg.players)) {
+                remoteMovesRef.current[id] = { sprinting: remoteMovesRef.current[id]?.sprinting, x: p.x, y: p.y, z: p.z, ry: remoteMovesRef.current[id]?.ry ?? 0, moving: p.state === "active" && (remoteMovesRef.current[id]?.moving ?? false) };
+              }
+              if (player) staminaRef.current = player.stamina;
+            }
+            if (msg.phase === "ended" && previous.phase === "playing") addSystemMessage(msg.result);
+            gameRef.current = msg;
+            setGame(msg);
+            break;
+          }
+          case "position":
+            Object.assign(localRef.current, { x: msg.x, y: msg.y, z: msg.z, vy: 0 });
+            break;
           case "welcome": {
             myProfileRef.current = { ...myProfileRef.current, id: msg.id, joinedAt: msg.you.joinedAt };
+            setMyProfile(myProfileRef.current);
             const map: Record<string, PeerState> = {};
             for (const p of msg.peers) map[p.id] = p;
             commitPeers(map);
@@ -494,6 +578,13 @@ export default function Page() {
           }
 
           case "peer-update":
+            if (msg.peer.id === myProfileRef.current.id) {
+              myProfileRef.current = msg.peer;
+              setMyProfile(msg.peer);
+              seatRef.current = msg.peer.seatIndex;
+              setSeatIndex(msg.peer.seatIndex);
+              break;
+            }
             if (!peersRef.current[msg.peer.id]) break;
             commitPeers({ ...peersRef.current, [msg.peer.id]: msg.peer });
             break;
@@ -507,6 +598,7 @@ export default function Page() {
 
           case "move":
             remoteMovesRef.current[msg.id] = {
+              sprinting: msg.sprinting,
               x: msg.x,
               y: msg.y,
               z: msg.z,
@@ -540,6 +632,8 @@ export default function Page() {
         if (cancelled || kicked) return;
 
         setConn("closed");
+        gameRef.current = EMPTY_GAME;
+        setGame(EMPTY_GAME);
         commitPeers({});
         remoteMovesRef.current = {};
 
@@ -757,21 +851,33 @@ export default function Page() {
       rigs.delete(id);
     };
 
-    const applyPose = (rig: AvatarRig, moving: boolean, seated: boolean, bounce: number, dt: number) => {
+    const applyPose = (rig: AvatarRig, moving: boolean, seated: boolean, bounce: number, dt: number, sprinting = false, frozen = false, coding = false) => {
       rig.group.position.set(rig.cur.x, rig.cur.y + bounce, rig.cur.z);
       rig.group.rotation.y = rig.cur.ry;
+      let armSwing = 0;
       if (seated) {
         rig.legL.rotation.x = -Math.PI / 2;
         rig.legR.rotation.x = -Math.PI / 2;
+        if (coding && !frozen) {
+          rig.walkPhase += dt * 12;
+          armSwing = Math.sin(rig.walkPhase) * 0.13;
+        }
       } else if (moving && rig.cur.y < 0.01) {
-        rig.walkPhase += dt * 10;
+        rig.walkPhase += dt * (sprinting ? 15 : 10);
         const s = Math.sin(rig.walkPhase) * 0.6;
         rig.legL.rotation.x = s;
         rig.legR.rotation.x = -s;
+        armSwing = Math.sin(rig.walkPhase) * (sprinting ? 0.95 : 0.55);
       } else {
         rig.legL.rotation.x *= 0.8;
         rig.legR.rotation.x *= 0.8;
       }
+      const blend = frozen ? 1 : 1 - Math.exp(-18 * dt);
+      const restAngle = seated ? (coding ? -1.15 : -0.65) : 0;
+      rig.armL.rotation.x += (restAngle - armSwing - rig.armL.rotation.x) * blend;
+      rig.armR.rotation.x += (restAngle + armSwing - rig.armR.rotation.x) * blend;
+      rig.armL.rotation.z = -0.1;
+      rig.armR.rotation.z = 0.1;
     };
 
     // 입력
@@ -798,7 +904,20 @@ export default function Page() {
 
     const MOVE_KEYS = ["KeyW", "KeyA", "KeyS", "KeyD", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"];
     const onKeyDown = (e: KeyboardEvent) => {
-      if (isTypingTarget(e.target)) return;
+      if (e.defaultPrevented || e.isComposing || isTypingTarget(e.target)) return;
+      if (e.code === "Enter" || e.code === "NumpadEnter") {
+        e.preventDefault();
+        if (!e.repeat) {
+          keysRef.current.clear();
+          jumpQueuedRef.current = false;
+          chatInputRef.current?.focus();
+        }
+        return;
+      }
+      if ((e.code === "KeyF" || e.code === "KeyG") && !e.repeat) {
+        sendRef.current?.({ t: e.code === "KeyF" ? "freeze" : "rescue" });
+        return;
+      }
       if (e.code === "Space") {
         e.preventDefault();
         if (!e.repeat) jumpQueuedRef.current = true;
@@ -808,7 +927,7 @@ export default function Page() {
         if (!e.repeat) interact();
         return;
       }
-      if (MOVE_KEYS.includes(e.code)) {
+      if (MOVE_KEYS.includes(e.code) || e.code === "ShiftLeft" || e.code === "ShiftRight") {
         e.preventDefault();
         keysRef.current.add(e.code);
       }
@@ -890,7 +1009,19 @@ export default function Page() {
       if (k.has("KeyS") || k.has("ArrowDown")) iz -= 1;
       if (k.has("KeyD") || k.has("ArrowRight")) ix += 1;
       if (k.has("KeyA") || k.has("ArrowLeft")) ix -= 1;
+      const currentGame = gameRef.current;
+      const gp = currentGame.players[myProfileRef.current.id];
+      const blocked = currentGame.phase === "playing" && (!gp || gp.state !== "active");
+      if (blocked) {
+        ix = 0; iz = 0;
+        jumpQueuedRef.current = false;
+        if (gp) Object.assign(me, { x: gp.x, z: gp.z, y: 0, vy: 0 });
+      }
       const moving = ix !== 0 || iz !== 0;
+      const sprinting = moving && (k.has("ShiftLeft") || k.has("ShiftRight")) && staminaRef.current > 1;
+      staminaRef.current = clamp(staminaRef.current + (sprinting ? -20 : 14) * dt, 0, 100);
+      setStamina(prev => Math.abs(prev - staminaRef.current) >= 1 ? Math.round(staminaRef.current) : prev);
+      const speed = sprinting ? WALK_SPEED * 1.6 : WALK_SPEED;
 
       if (moving && seatRef.current !== null) standUp();
 
@@ -905,8 +1036,8 @@ export default function Page() {
         const len = Math.hypot(dx, dz) || 1;
         dx /= len;
         dz /= len;
-        let nx = me.x + dx * WALK_SPEED * dt;
-        let nz = me.z + dz * WALK_SPEED * dt;
+        let nx = me.x + dx * speed * dt;
+        let nz = me.z + dz * speed * dt;
         const r = Math.hypot(nx, nz);
         if (r < TABLE_COLLISION_RADIUS) {
           if (r < 0.001) {
@@ -923,7 +1054,7 @@ export default function Page() {
 
       if (jumpQueuedRef.current) {
         jumpQueuedRef.current = false;
-        if (me.y <= 0.0001 && seatRef.current === null) me.vy = JUMP_VEL;
+        if (!blocked && me.y <= 0.0001 && seatRef.current === null) me.vy = JUMP_VEL;
       }
       if (me.y > 0 || me.vy > 0) {
         me.vy -= GRAVITY * dt;
@@ -946,9 +1077,12 @@ export default function Page() {
         moving,
         seatRef.current !== null,
         myGestureOn ? Math.abs(Math.sin(now * 0.012)) * 0.25 : 0,
-        dt
+        dt,
+        sprinting,
+        blocked,
+        myProfile.status === "coding"
       );
-      updateLabel(localRig, myProfile, myGestureOn ? myGesture.emoji : "", true);
+      updateLabel(localRig, myProfile, myGestureOn ? myGesture.emoji : "", true, gameBadge(currentGame, myProfile.id));
       placeLabel(localRig);
 
       // ─ 원격 아바타 생성/삭제 ─
@@ -1001,8 +1135,8 @@ export default function Page() {
         }
         const g = gestureRef.current[id];
         const gOn = !!g && g.until > wall;
-        applyPose(rig, mv, seated, gOn ? Math.abs(Math.sin(now * 0.012)) * 0.25 : 0, dt);
-        updateLabel(rig, p, gOn ? g.emoji : "", false);
+        applyPose(rig, mv, seated, gOn ? Math.abs(Math.sin(now * 0.012)) * 0.25 : 0, dt, pm?.sprinting, currentGame.phase === "playing" && currentGame.players[id]?.state !== "active", p.status === "coding");
+        updateLabel(rig, p, gOn ? g.emoji : "", false, gameBadge(currentGame, id));
         placeLabel(rig);
       }
 
@@ -1038,9 +1172,10 @@ export default function Page() {
           z: round2(me.z),
           ry: round2(wrapAngle(me.ry)),
           moving,
+          sprinting,
         };
-        const key = `${pkt.x},${pkt.y},${pkt.z},${pkt.ry},${moving}`;
-        if (key !== lastSentKey || now - lastHeartbeat > 1000) {
+        const key = `${pkt.x},${pkt.y},${pkt.z},${pkt.ry},${moving},${sprinting}`;
+        if (key !== lastSentKey || now - lastHeartbeat > (currentGame.phase === "playing" ? MOVE_SEND_INTERVAL : 1000)) {
           sendRef.current?.({ t: "move", ...pkt });
           lastSentKey = key;
           lastHeartbeat = now;
@@ -1081,6 +1216,7 @@ export default function Page() {
       seatIndex: null,
       joinedAt: 0,
     };
+    setMyProfile(myProfileRef.current);
     statusRef.current = "coding";
     setStatus("coding");
     seatRef.current = null;
@@ -1089,6 +1225,10 @@ export default function Page() {
     commitPeers({});
     remoteMovesRef.current = {};
     gestureRef.current = {};
+    gameRef.current = EMPTY_GAME;
+    setGame(EMPTY_GAME);
+    staminaRef.current = 100;
+    setStamina(100);
     setActiveRoom(roomName);
     setMessages([
       {
@@ -1113,10 +1253,10 @@ export default function Page() {
     setChatInput("");
   };
 
-  const handleGesture = (emoji: string) => {
+  const handleGesture = useCallback((emoji: string) => {
     gestureRef.current[SELF_KEY] = { emoji, until: Date.now() + GESTURE_MS };
     sendRef.current?.({ t: "gesture", emoji });
-  };
+  }, []);
 
   const toggleStatus = () => {
     const next: Status = statusRef.current === "coding" ? "resting" : "coding";
@@ -1254,7 +1394,14 @@ export default function Page() {
     <main className="flex h-screen w-full overflow-hidden bg-slate-950 text-white">
       {/* 3D 영역 */}
       <section className="relative flex-1">
-        <div ref={mountRef} className="absolute inset-0" />
+        <div
+          ref={mountRef}
+          tabIndex={-1}
+          role="region"
+          aria-label="3D 방 · WASD 이동 · Enter 채팅"
+          onPointerDown={() => mountRef.current?.focus({ preventScroll: true })}
+          className="absolute inset-0 outline-none"
+        />
         <div ref={labelLayerRef} className="pointer-events-none absolute inset-0 overflow-hidden" />
 
         {/* HUD 상단 */}
@@ -1294,8 +1441,35 @@ export default function Page() {
           </button>
         </div>
 
+        {/* 얼음땡 HUD */}
+        <div className="absolute right-3 top-16 w-60 rounded-2xl border border-cyan-300/20 bg-slate-950/90 p-4 shadow-xl">
+          <p className="font-bold text-cyan-200">🧊 얼음땡 <span className="float-right tabular-nums">{game.phase === "playing" ? `${Math.max(0, Math.ceil((game.endsAt - game.serverNow) / 1000))}초` : "60초"}</span></p>
+          {game.phase === "playing" ? <>
+            <p className="mt-2 text-sm">{gameBadge(game, myProfile.id)}</p>
+            <p className="mt-1 text-xs text-slate-300">술래: {game.taggerId === myProfile.id ? myProfile.name : peers[game.taggerId ?? ""]?.name ?? "동료"}</p>
+            <p className="mt-1 text-xs text-slate-300">생존 {Object.entries(game.players).filter(([id, p]) => id !== game.taggerId && p.state !== "out").length}명 · 얼음 {Object.values(game.players).filter(p => p.state === "frozen").length}명</p>
+            <div className="mt-3 flex gap-2">
+              <button type="button" disabled={conn !== "open" || game.taggerId === myProfile.id || game.players[myProfile.id]?.state !== "active"} onClick={() => sendRef.current?.({ t: "freeze" })} className="flex-1 rounded-lg bg-cyan-800 p-2 text-xs disabled:opacity-40">🧊 얼음 F</button>
+              <button type="button" disabled={conn !== "open" || game.taggerId === myProfile.id || game.players[myProfile.id]?.state !== "active"} onClick={() => sendRef.current?.({ t: "rescue" })} className="flex-1 rounded-lg bg-indigo-700 p-2 text-xs disabled:opacity-40">✨ 땡 G</button>
+            </div>
+          </> : <>
+            {game.result && <p role="status" className="mt-2 text-sm text-amber-200">{game.result}</p>}
+            {game.taggerId && <p className="mt-2 text-xs text-red-300">추첨된 술래: {game.taggerId === myProfile.id ? myProfile.name : peers[game.taggerId]?.name ?? "동료"}</p>}
+            {game.hostId === myProfile.id && conn === "open" ? <div className="mt-3 flex flex-col gap-2">
+              <button type="button" disabled={peerCount < 1} onClick={() => sendRef.current?.({ t: "game-start" })} className="rounded-lg bg-cyan-600 py-2 text-sm font-bold disabled:opacity-40">얼음땡 시작 · 자동 추첨</button>
+              <button type="button" disabled={peerCount < 1} onClick={() => sendRef.current?.({ t: "game-random" })} className="rounded-lg bg-white/10 py-2 text-xs disabled:opacity-40">🎲 술래 랜덤 배정</button>
+            </div> : <p className="mt-3 text-xs text-slate-300">방장이 게임을 시작할 수 있어요.</p>}
+            {peerCount < 1 && <p className="mt-2 text-xs text-slate-400">2명 이상 모이면 시작해요.</p>}
+          </>}
+          <p className="mt-3 text-[11px] text-slate-400">F 얼음 · 가까운 동료에게 G 땡<br />얼음은 무적 · 전원 얼음/탈락 시 술래 승리</p>
+        </div>
+
         {/* HUD 하단 */}
         <div className="absolute bottom-3 left-1/2 flex -translate-x-1/2 flex-col items-center gap-2">
+          <div className="w-48 rounded-xl bg-black/70 px-3 py-2">
+            <div className="mb-1 flex justify-between text-[11px] text-cyan-100"><span>⚡ 스태미너</span><span>{stamina}%</span></div>
+            <div role="progressbar" aria-label="스태미너" aria-valuenow={stamina} aria-valuemin={0} aria-valuemax={100} className="h-2 overflow-hidden rounded-full bg-white/15"><div className="h-full rounded-full bg-cyan-400" style={{ width: `${stamina}%` }} /></div>
+          </div>
           <div className="flex gap-1 rounded-full bg-black/60 p-1">
             {GESTURES.map((g) => (
               <button
@@ -1316,7 +1490,7 @@ export default function Page() {
             </button>
           </div>
           <p className="rounded bg-black/50 px-2 py-1 text-[11px] text-slate-300">
-            WASD/방향키 이동 · Space 점프 · E 앉기/일어나기 · 의자 클릭 착석 · 드래그로 시점 회전
+            WASD/방향키 이동 · Shift 달리기 · F 얼음 / G 땡 · Space 점프 · E 앉기/일어나기 · Enter 채팅/빈 입력에서 복귀 · 의자 클릭 착석 · 드래그로 시점 회전
             {seatIndex !== null && ` · ${seatIndex + 1}번 자리`}
           </p>
         </div>
@@ -1330,14 +1504,24 @@ export default function Page() {
           </p>
           <ul className="space-y-1 text-sm">
             <li className="flex items-center gap-2">
-              <span className="h-2 w-2 rounded-full" style={{ backgroundColor: myProfileRef.current.color }} />
-              {myProfileRef.current.avatar} {myProfileRef.current.name} (나)
+              <span className="h-2 w-2 rounded-full" style={{ backgroundColor: myProfile.color }} />
+              {myProfile.avatar} {myProfile.name} (나) {game.hostId === myProfile.id ? "👑" : ""} {gameBadge(game, myProfile.id)}
               <span className="ml-auto text-xs">{status === "coding" ? "💻" : "☕"}</span>
             </li>
             {peerList.map((p) => (
               <li key={p.id} className="flex items-center gap-2">
                 <span className="h-2 w-2 rounded-full" style={{ backgroundColor: p.color }} />
-                {p.avatar} {p.name}
+                {p.avatar} {p.name} {game.hostId === p.id ? "👑" : ""} {gameBadge(game, p.id)}
+                {game.hostId === myProfile.id && conn === "open" && (
+                  <button
+                    type="button"
+                    onClick={() => sendRef.current?.({ t: "host-transfer", targetId: p.id })}
+                    className="shrink-0 rounded-md bg-amber-400/10 px-2 py-1 text-[11px] text-amber-200 hover:bg-amber-400/20"
+                    aria-label={`${p.name}님에게 방장 넘기기`}
+                  >
+                    👑 넘기기
+                  </button>
+                )}
                 <span className="ml-auto text-xs">{p.status === "coding" ? "💻" : "☕"}</span>
               </li>
             ))}
@@ -1369,17 +1553,30 @@ export default function Page() {
 
         <div className="flex gap-2 border-t border-white/10 p-3">
           <input
+            ref={chatInputRef}
             className="flex-1 rounded-lg bg-slate-800 px-3 py-2 text-sm outline-none ring-indigo-500 focus:ring-2"
-            placeholder="메시지 입력"
+            placeholder="Enter 전송 · 빈 입력 Enter로 이동"
             maxLength={MAX_CHAT_LEN}
             value={chatInput}
-            onFocus={() => keysRef.current.clear()}
+            onFocus={() => {
+              keysRef.current.clear();
+              jumpQueuedRef.current = false;
+            }}
             onChange={(e) => setChatInput(e.target.value)}
             onKeyDown={(e) => {
               // 한글 IME 조합 중 Enter 중복 전송 방지
-              if (e.key === "Enter" && !e.nativeEvent.isComposing) {
+              if (e.key === "Enter" && !e.nativeEvent.isComposing && e.nativeEvent.keyCode !== 229) {
                 e.preventDefault();
-                handleSendChat();
+                e.stopPropagation();
+                if (e.repeat) return;
+                if (chatInput.trim()) {
+                  handleSendChat();
+                } else {
+                  setChatInput("");
+                  keysRef.current.clear();
+                  jumpQueuedRef.current = false;
+                  mountRef.current?.focus({ preventScroll: true });
+                }
               }
             }}
           />

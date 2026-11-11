@@ -3,10 +3,11 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "dev": "next dev",
+    "dev": "node server.mjs --dev",
     "build": "next build",
-    "start": "next start",
-    "lint": "eslint"
+    "start": "node server.mjs",
+    "lint": "eslint",
+    "test": "node --test tests/*.test.mjs"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.119.0",
@@ -16,7 +17,8 @@
     "react": "19.3.0",
     "react-dom": "19.3.0",
     "three": "^0.187.0",
-    "trystero": "^0.26.0"
+    "trystero": "^0.26.0",
+    "ws": "^8.22.2"
   },
   "devDependencies": {
     "@tailwindcss/turbopack": "4.3.3",
