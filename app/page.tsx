@@ -15,15 +15,18 @@ import {
   VolumeX,
   Wifi,
   RotateCcw,
+  RefreshCw,
   Footprints,
   Armchair,
 } from "lucide-react";
 
-const APP_ID = "mogakko-3d-walk-p2p-v3"; // 프로토콜이 바뀌었으므로 구버전 클라이언트와 분리
+const APP_ID = "mogakko-3d-walk-p2p-v3";
 const SEAT_RADIUS = 3.35;
 const ROOM_BOUNDARY = 7.8;
 const TABLE_COLLISION_RADIUS = 2.65;
 const MAX_PLAYERS = 6;
+const RELAY_REDUNDANCY = 6; // 동시에 붙을 공개 Nostr 릴레이 개수
+const ALONE_HINT_MS = 20000; // 입장 후 이 시간 동안 아무도 안 보이면 재연결 안내
 
 type PeerState = {
   peerId: string;
@@ -66,20 +69,24 @@ type GesturePayload = {
   label: string;
 };
 
-// ---------------------------------------------------------------------------
-// Trystero 0.26 API 최소 타입 (makeAction → { send, onMessage }, onPeerJoin 속성)
-// ---------------------------------------------------------------------------
+// Trystero 0.26 API 최소 타입
 type TrysteroAction<T> = {
   send: (data: T, options?: { target?: string | string[] | null }) => Promise<unknown>;
   onMessage: ((data: T, ctx: { peerId: string }) => void) | null;
 };
 
 type TrysteroRoom = {
-  leave: () => unknown;
+  leave: () => Promise<unknown> | unknown;
   makeAction: (id: string) => unknown;
   onPeerJoin: ((peerId: string) => void) | null;
   onPeerLeave: ((peerId: string) => void) | null;
 };
+
+type JoinRoomFn = (
+  config: Record<string, unknown>,
+  roomId: string,
+  callbacks?: { onJoinError?: (info: { peerId: string; error: unknown }) => void }
+) => unknown;
 
 type SendFn<T> = (data: T, target?: string) => void;
 
@@ -164,8 +171,13 @@ function disposeObject(obj: THREE.Object3D) {
 const nowTime = () =>
   new Date().toLocaleTimeString("ko-KR", { hour: "2-digit", minute: "2-digit" });
 
+const isSecureEnv = () =>
+  typeof window !== "undefined" && window.isSecureContext && !!globalThis.crypto?.subtle;
+
 export default function Mogakko3DWalkableRoom() {
   const [myId, setMyId] = useState<string>("");
+  const [initError, setInitError] = useState<string | null>(null);
+  const [reconnectKey, setReconnectKey] = useState<number>(0);
 
   const [nickname, setNickname] = useState<string>("");
   const [selectedAvatar, setSelectedAvatar] = useState<string>("🧑‍💻");
@@ -205,6 +217,7 @@ export default function Mogakko3DWalkableRoom() {
   const pendingJumpsRef = useRef<Set<string>>(new Set());
 
   const roomRef = useRef<TrysteroRoom | null>(null);
+  const leavingRef = useRef<Promise<unknown> | null>(null); // 이전 방 leave 완료 대기용
   const sendProfileRef = useRef<SendFn<PeerState> | null>(null);
   const sendMoveRef = useRef<SendFn<MovePacket> | null>(null);
   const sendChatRef = useRef<SendFn<ChatPayload> | null>(null);
@@ -214,12 +227,20 @@ export default function Mogakko3DWalkableRoom() {
   const soundOnRef = useRef(true);
   const audioCtxRef = useRef<AudioContext | null>(null);
 
-  // Trystero의 selfId를 내 ID로 사용 (상대방이 보는 peerId와 동일)
+  // Trystero selfId 로드 + 보안 컨텍스트 확인
   useEffect(() => {
     let alive = true;
-    void import("trystero").then((m) => {
-      if (alive) setMyId(m.selfId);
-    });
+    if (!isSecureEnv()) {
+      setInitError("HTTPS(또는 localhost)로 접속해야 P2P 연결이 가능합니다.");
+    }
+    import("trystero")
+      .then((m) => {
+        if (alive) setMyId(m.selfId);
+      })
+      .catch((err) => {
+        console.error(err);
+        if (alive) setInitError("P2P 모듈을 불러오지 못했습니다. 콘솔을 확인해 주세요.");
+      });
     return () => {
       alive = false;
     };
@@ -235,13 +256,11 @@ export default function Mogakko3DWalkableRoom() {
     };
   }, []);
 
-  // 피어 상태를 ref와 state에 동시에 반영 (업데이터 내부 사이드이펙트 제거)
   const commitPeers = useCallback((next: Record<string, PeerState>) => {
     peersRef.current = next;
     setPeers(next);
   }, []);
 
-  // 의존성 없는 안정적인 알림음 (소리 토글이 P2P 재연결을 유발하지 않음)
   const playChime = useCallback(() => {
     if (!soundOnRef.current || typeof window === "undefined") return;
     try {
@@ -327,28 +346,21 @@ export default function Mogakko3DWalkableRoom() {
     setMySeat(-1);
   }, []);
 
+  // 실제 room.leave()는 P2P effect cleanup에서 한 번만 수행
   const handleLeaveRoom = useCallback(() => {
-    const room = roomRef.current;
-    if (room) {
-      room.onPeerJoin = null;
-      room.onPeerLeave = null;
-      try {
-        room.leave();
-      } catch {
-        /* noop */
-      }
-      roomRef.current = null;
-    }
-    sendProfileRef.current = null;
-    sendMoveRef.current = null;
-    sendChatRef.current = null;
-    sendGestureRef.current = null;
     myPhysicsRef.current.seatIndex = -1;
     pendingJumpsRef.current.clear();
     setMySeat(-1);
     setNearSeat(null);
     setJoined(false);
     commitPeers({});
+  }, [commitPeers]);
+
+  // 새로고침 없이 P2P만 다시 연결
+  const handleReconnect = useCallback(() => {
+    commitPeers({});
+    pendingJumpsRef.current.clear();
+    setReconnectKey((k) => k + 1);
   }, [commitPeers]);
 
   // 내 프로필 변경 시 브로드캐스트
@@ -403,7 +415,6 @@ export default function Mogakko3DWalkableRoom() {
           const taken = new Set(peerList.map((p) => p.seatIndex));
           const free = [0, 1, 2, 3, 4, 5].find((s) => !taken.has(s));
           if (free !== undefined) {
-            // 내 좌석을 먼저 비운 뒤 이동
             myPhysicsRef.current.seatIndex = -1;
             sitOnSeat(free);
           } else {
@@ -481,22 +492,50 @@ export default function Mogakko3DWalkableRoom() {
   }, [joined, sitOnSeat, standUpFromSeat]);
 
   // ==========================================================================
-  // P2P 룸 연결 (Trystero 0.26)
+  // P2P 룸 연결 (Trystero 0.26, 공개 Nostr 릴레이)
   // ==========================================================================
   useEffect(() => {
     if (!joined || !myId) return;
 
     let active = true;
     let room: TrysteroRoom | null = null;
+    let aloneTimer: number | undefined;
     const roomName = roomId.trim();
     setIsConnecting(true);
 
+    if (!isSecureEnv()) {
+      setIsConnecting(false);
+      appendSystemMessage(
+        "⚠️ 보안 연결(HTTPS)이 아니라 P2P 연결이 불가능합니다. https 주소(배포 사이트)로 접속해 주세요."
+      );
+      return;
+    }
+
     const connect = async () => {
       try {
-        const { joinRoom } = await import("trystero");
+        // 직전 방의 leave가 끝날 때까지 대기 (빠른 재연결 시 꼬임 방지)
+        if (leavingRef.current) {
+          await leavingRef.current.catch(() => {});
+          leavingRef.current = null;
+        }
+
+        const { joinRoom } = (await import("trystero")) as unknown as { joinRoom: JoinRoomFn };
         if (!active) return;
 
-        room = joinRoom({ appId: APP_ID }, roomName) as unknown as TrysteroRoom;
+        room = joinRoom(
+          { appId: APP_ID, relayConfig: { redundancy: RELAY_REDUNDANCY } },
+          roomName,
+          {
+            onJoinError: ({ peerId, error }) => {
+              console.warn("[P2P] join error", peerId, error);
+              if (active) {
+                appendSystemMessage(
+                  "⚠️ 참여자를 찾았지만 직접 연결에 실패했습니다. 🔄 재연결을 눌러보세요. (회사망/VPN 제한일 수 있어요)"
+                );
+              }
+            },
+          }
+        ) as TrysteroRoom;
         roomRef.current = room;
 
         const [profileAction, sendProfile] = createAction<PeerState>(room, "profile");
@@ -517,7 +556,6 @@ export default function Mogakko3DWalkableRoom() {
           commitPeers({ ...prev, [peerId]: { ...data, peerId } });
         };
 
-        // 이동 패킷은 ref만 갱신 (좌석이 바뀔 때만 React 렌더)
         moveAction.onMessage = (pkt, { peerId }) => {
           const prev = peersRef.current;
           const existing = prev[peerId];
@@ -582,11 +620,19 @@ export default function Mogakko3DWalkableRoom() {
         appendSystemMessage(
           `'${roomName}' 3D 모각코룸에 입장했습니다! WASD(방향키)로 걸어 다니고, 의자를 클릭하거나 [E] 키를 눌러 착석해 보세요.`
         );
+
+        aloneTimer = window.setTimeout(() => {
+          if (active && Object.keys(peersRef.current).length === 0) {
+            appendSystemMessage(
+              "아직 다른 참여자가 보이지 않아요. 동료가 같은 방 이름으로 입장했다면 상단 🔄 버튼으로 재연결해 보세요."
+            );
+          }
+        }, ALONE_HINT_MS);
       } catch (err) {
         console.error(err);
         if (active) {
           setIsConnecting(false);
-          appendSystemMessage("P2P 연결에 실패했습니다. 잠시 후 다시 입장해 주세요.");
+          appendSystemMessage("P2P 연결에 실패했습니다. 🔄 버튼으로 다시 시도해 주세요.");
         }
       }
     };
@@ -595,11 +641,12 @@ export default function Mogakko3DWalkableRoom() {
 
     return () => {
       active = false;
+      window.clearTimeout(aloneTimer);
       if (room) {
         room.onPeerJoin = null;
         room.onPeerLeave = null;
         try {
-          room.leave();
+          leavingRef.current = Promise.resolve(room.leave());
         } catch {
           /* noop */
         }
@@ -610,7 +657,7 @@ export default function Mogakko3DWalkableRoom() {
       sendChatRef.current = null;
       sendGestureRef.current = null;
     };
-  }, [joined, roomId, myId, appendSystemMessage, playChime, triggerFloatingGesture, commitPeers]);
+  }, [joined, roomId, myId, reconnectKey, appendSystemMessage, playChime, triggerFloatingGesture, commitPeers]);
 
   // ==========================================================================
   // Three.js 월드 + 물리 + 렌더 루프
@@ -633,7 +680,7 @@ export default function Mogakko3DWalkableRoom() {
     renderer.setSize(viewW, viewH);
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     renderer.shadowMap.enabled = true;
-    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    renderer.shadowMap.type = THREE.PCFShadowMap;
     container.appendChild(renderer.domElement);
 
     const controls = new OrbitControls(camera, renderer.domElement);
@@ -662,7 +709,6 @@ export default function Mogakko3DWalkableRoom() {
     dirLight.shadow.camera.bottom = -10;
     scene.add(dirLight);
 
-    // PointLight 그림자는 큐브맵 6회 렌더링이라 비용이 커서 끔
     const centerWarmLight = new THREE.PointLight("#fbbf24", 2.3, 11);
     centerWarmLight.position.set(0, 2.1, 0);
     scene.add(centerWarmLight);
@@ -929,7 +975,6 @@ export default function Mogakko3DWalkableRoom() {
     renderer.domElement.addEventListener("pointerdown", onPointerDown);
     renderer.domElement.addEventListener("pointerup", onPointerUp);
 
-    // 컨테이너 크기 변화(레이아웃 전환 포함) 감지
     const resizeObserver = new ResizeObserver(() => {
       viewW = container.clientWidth || 1;
       viewH = container.clientHeight || 1;
@@ -939,7 +984,8 @@ export default function Mogakko3DWalkableRoom() {
     });
     resizeObserver.observe(container);
 
-    const clock = new THREE.Clock();
+    const timer = new THREE.Timer();
+    timer.connect(document); // 탭 숨김 후 복귀 시 dt 튐 방지
     const camForward = new THREE.Vector3();
     const camRight = new THREE.Vector3();
     const projVec = new THREE.Vector3();
@@ -949,10 +995,11 @@ export default function Mogakko3DWalkableRoom() {
     let lastNetworkSend = 0;
     let lastMovingSent = false;
 
-    const animate = () => {
+    const animate = (timestamp?: number) => {
       frameId = window.requestAnimationFrame(animate);
-      const dt = Math.min(clock.getDelta(), 0.05);
-      const elapsed = clock.elapsedTime;
+      timer.update(timestamp);
+      const dt = Math.min(timer.getDelta(), 0.05);
+      const elapsed = timer.getElapsed();
       const seatLerp = 1 - Math.exp(-14 * dt);
       const remoteLerp = 1 - Math.exp(-12 * dt);
       controls.update();
@@ -1229,6 +1276,7 @@ export default function Mogakko3DWalkableRoom() {
 
     return () => {
       window.cancelAnimationFrame(frameId);
+      timer.dispose();
       resizeObserver.disconnect();
       renderer.domElement.removeEventListener("pointermove", onPointerMove);
       renderer.domElement.removeEventListener("pointerdown", onPointerDown);
@@ -1264,7 +1312,7 @@ export default function Mogakko3DWalkableRoom() {
     commitPeers({});
     setMessages([]);
     setJoined(true);
-    playChime(); // 사용자 제스처 시점에 AudioContext 활성화
+    playChime();
   };
 
   const handleSendGesture = (emoji: string, label: string) => {
@@ -1290,6 +1338,8 @@ export default function Mogakko3DWalkableRoom() {
     sendChatRef.current?.(msg);
     setInputText("");
   };
+
+  const peerCount = Object.keys(peers).length;
 
   const visiblePlayers: PeerState[] = [];
   if (joined && myId) {
@@ -1408,6 +1458,12 @@ export default function Mogakko3DWalkableRoom() {
               </div>
             </div>
 
+            {initError && (
+              <p className="text-xs text-red-300 bg-red-950/40 border border-red-800/50 rounded-xl p-2.5">
+                {initError}
+              </p>
+            )}
+
             <button
               type="submit"
               disabled={!myId}
@@ -1498,8 +1554,15 @@ export default function Mogakko3DWalkableRoom() {
                 <span className="text-xs px-2 py-0.5 rounded-full bg-slate-800 text-slate-200 flex items-center gap-1">
                   <Users className="w-3 h-3 text-indigo-400" /> {visiblePlayers.length} / {MAX_PLAYERS}
                 </span>
-                <span className="text-[11px] px-2 py-0.5 rounded-full bg-emerald-950/80 border border-emerald-700/50 text-emerald-300 flex items-center gap-1">
-                  <Wifi className="w-3 h-3" /> {isConnecting ? "연결 중..." : "P2P Live"}
+                <span
+                  className={`text-[11px] px-2 py-0.5 rounded-full border flex items-center gap-1 ${
+                    peerCount > 0
+                      ? "bg-emerald-950/80 border-emerald-700/50 text-emerald-300"
+                      : "bg-amber-950/80 border-amber-700/50 text-amber-300"
+                  }`}
+                >
+                  <Wifi className="w-3 h-3" />
+                  {isConnecting ? "연결 중..." : peerCount > 0 ? `P2P 연결 ${peerCount}명` : "참여자 대기 중"}
                 </span>
               </div>
               <p className="text-[11px] text-slate-400 mt-0.5 hidden sm:block">
@@ -1509,6 +1572,14 @@ export default function Mogakko3DWalkableRoom() {
           </div>
 
           <div className="pointer-events-auto flex items-center gap-2">
+            <button
+              type="button"
+              onClick={handleReconnect}
+              className="p-2.5 rounded-xl bg-slate-900/85 border border-slate-800 backdrop-blur-md text-slate-300 hover:text-emerald-300 transition shadow-lg"
+              title="P2P 재연결"
+            >
+              <RefreshCw className="w-4 h-4" />
+            </button>
             <button
               type="button"
               onClick={() => cameraResetRef.current?.()}
