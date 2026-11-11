@@ -1,1745 +1,1398 @@
 "use client";
 
-import React, { useState, useEffect, useRef, useCallback } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
-import {
-  Terminal,
-  Send,
-  Coffee,
-  Sparkles,
-  Code2,
-  LogOut,
-  Users,
-  Volume2,
-  VolumeX,
-  Wifi,
-  RotateCcw,
-  RefreshCw,
-  Footprints,
-  Armchair,
-} from "lucide-react";
+import { LogOut, RefreshCw, Send, Users, Volume2, VolumeX } from "lucide-react";
 
-const APP_ID = "mogakko-3d-walk-p2p-v3";
+/* =========================================================
+ * 상수 (server.mjs와 값 맞춤)
+ * ======================================================= */
+const SEAT_COUNT = 6;
 const SEAT_RADIUS = 3.35;
+const TABLE_RADIUS = 2.4;
 const ROOM_BOUNDARY = 7.8;
 const TABLE_COLLISION_RADIUS = 2.65;
 const MAX_PLAYERS = 6;
-const RELAY_REDUNDANCY = 6; // 동시에 붙을 공개 Nostr 릴레이 개수
-const ALONE_HINT_MS = 20000; // 입장 후 이 시간 동안 아무도 안 보이면 재연결 안내
+const DEFAULT_WS_PORT = 3001;
+const MOVE_SEND_INTERVAL = 66; // 약 15Hz
+const SIT_DISTANCE = 1.65;
+const WALK_SPEED = 3.9;
+const JUMP_VEL = 5.2;
+const GRAVITY = 14;
+const MAX_MESSAGES = 99;
+const MAX_CHAT_LEN = 500;
+const GESTURE_MS = 2500;
+const SELF_KEY = "__me__";
+
+const AVATARS = ["🐱", "🐶", "🦊", "🐼", "🐻", "🐰", "🐸", "🐧"];
+const COLORS = ["#6366f1", "#ec4899", "#f59e0b", "#10b981", "#0ea5e9", "#ef4444"];
+const GESTURES = ["👋", "☕", "🔥", "🎉", "🫠"];
+
+/* =========================================================
+ * 타입
+ * ======================================================= */
+type Status = "coding" | "resting";
+type ConnState = "connecting" | "open" | "closed";
 
 type PeerState = {
-  peerId: string;
-  nickname: string;
+  id: string;
+  name: string;
+  goal: string;
   avatar: string;
   color: string;
-  seatIndex: number;
-  x: number;
-  z: number;
-  rotY: number;
-  isMoving: boolean;
-  status: "coding" | "resting";
-  task: string;
+  status: Status;
+  seatIndex: number | null;
   joinedAt: number;
 };
 
-type MovePacket = {
-  seatIndex: number;
-  x: number;
-  z: number;
-  rotY: number;
-  isMoving: boolean;
-  jump: boolean;
-};
+type MovePacket = { x: number; y: number; z: number; ry: number; moving: boolean };
+type JoinProfile = Omit<PeerState, "id" | "joinedAt">;
+type HostInfo = { ips: string[]; port: number; wsPort: number };
 
-type ChatPayload = {
+type ClientMsg =
+  | { t: "join"; room: string; profile: JoinProfile }
+  | { t: "seat"; seatIndex: number | null }
+  | { t: "status"; status: Status }
+  | ({ t: "move" } & MovePacket)
+  | { t: "chat"; text: string }
+  | { t: "gesture"; emoji: string };
+
+type ServerMsg =
+  | { t: "welcome"; id: string; you: PeerState; peers: PeerState[] }
+  | { t: "full"; max: number }
+  | { t: "peer-join"; peer: PeerState }
+  | { t: "peer-leave"; id: string }
+  | { t: "peer-update"; peer: PeerState }
+  | { t: "seat-denied"; seatIndex: number }
+  | ({ t: "move"; id: string } & MovePacket)
+  | { t: "chat"; id: string; text: string }
+  | { t: "gesture"; id: string; emoji: string };
+
+type ChatMessage = {
   id: string;
-  senderId: string;
-  nickname: string;
-  avatar: string;
+  kind: "chat" | "system";
   text: string;
-  timestamp: string;
-  isSystem?: boolean;
+  name?: string;
+  avatar?: string;
+  color?: string;
+  mine?: boolean;
 };
 
-type GesturePayload = {
-  id: string;
-  peerId: string;
-  emoji: string;
-  label: string;
+type LocalPlayer = { x: number; y: number; z: number; ry: number; vy: number; moving: boolean };
+
+type AvatarRig = {
+  group: THREE.Group;
+  legL: THREE.Mesh;
+  legR: THREE.Mesh;
+  label: HTMLDivElement;
+  labelSig: string;
+  walkPhase: number;
+  initialized: boolean;
+  cur: { x: number; y: number; z: number; ry: number };
 };
 
-// Trystero 0.26 API 최소 타입
-type TrysteroAction<T> = {
-  send: (data: T, options?: { target?: string | string[] | null }) => Promise<unknown>;
-  onMessage: ((data: T, ctx: { peerId: string }) => void) | null;
-};
+/* =========================================================
+ * 유틸
+ * ======================================================= */
+function makeId() {
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
 
-type TrysteroRoom = {
-  leave: () => Promise<unknown> | unknown;
-  makeAction: (id: string) => unknown;
-  onPeerJoin: ((peerId: string) => void) | null;
-  onPeerLeave: ((peerId: string) => void) | null;
-};
+function clamp(v: number, min: number, max: number) {
+  return Math.max(min, Math.min(max, v));
+}
 
-type JoinRoomFn = (
-  config: Record<string, unknown>,
-  roomId: string,
-  callbacks?: { onJoinError?: (info: { peerId: string; error: unknown }) => void }
-) => unknown;
+function round2(v: number) {
+  return Math.round(v * 100) / 100;
+}
 
-type SendFn<T> = (data: T, target?: string) => void;
+function wrapAngle(a: number) {
+  return Math.atan2(Math.sin(a), Math.cos(a));
+}
 
-function createAction<T>(room: TrysteroRoom, id: string): [TrysteroAction<T>, SendFn<T>] {
-  const action = room.makeAction(id) as TrysteroAction<T>;
-  const send: SendFn<T> = (data, target) => {
-    try {
-      const p = action.send(data, target ? { target } : undefined);
-      if (p && typeof (p as Promise<unknown>).catch === "function") {
-        (p as Promise<unknown>).catch(() => {});
-      }
-    } catch {
-      // 연결 종료 중 전송 실패는 무시
-    }
+function lerpAngle(a: number, b: number, t: number) {
+  return a + wrapAngle(b - a) * t;
+}
+
+function getSeatTransform(i: number) {
+  const a = (i / SEAT_COUNT) * Math.PI * 2;
+  return { x: Math.sin(a) * SEAT_RADIUS, z: Math.cos(a) * SEAT_RADIUS, ry: a + Math.PI };
+}
+
+function isTypingTarget(t: EventTarget | null) {
+  const el = t as HTMLElement | null;
+  if (!el) return false;
+  return el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.isContentEditable;
+}
+
+function disposeObject(root: THREE.Object3D) {
+  root.traverse((o) => {
+    const m = o as THREE.Mesh;
+    if (m.geometry) m.geometry.dispose();
+    const mat = m.material as THREE.Material | THREE.Material[] | undefined;
+    if (Array.isArray(mat)) mat.forEach((x) => x.dispose());
+    else if (mat) mat.dispose();
+  });
+}
+
+function createLabel(layer: HTMLDivElement) {
+  const el = document.createElement("div");
+  el.className =
+    "absolute left-0 top-0 flex flex-col items-center whitespace-nowrap pointer-events-none select-none will-change-transform";
+  const gesture = document.createElement("div");
+  gesture.className = "mb-1 text-3xl leading-none";
+  const name = document.createElement("div");
+  name.className = "rounded-full bg-black/60 px-2 py-0.5 text-xs font-semibold text-white";
+  const goal = document.createElement("div");
+  goal.className = "mt-0.5 max-w-[160px] truncate rounded bg-white/85 px-1.5 text-[10px] text-slate-800";
+  el.append(gesture, name, goal);
+  layer.appendChild(el);
+  return el;
+}
+
+function createRig(color: string, layer: HTMLDivElement): AvatarRig {
+  const mat = new THREE.MeshStandardMaterial({ color, roughness: 0.6 });
+  const skin = new THREE.MeshStandardMaterial({ color: "#ffe0bd", roughness: 0.8 });
+  const dark = new THREE.MeshStandardMaterial({ color: "#1f2937", roughness: 0.7 });
+
+  const group = new THREE.Group();
+  const body = new THREE.Mesh(new THREE.CylinderGeometry(0.3, 0.34, 0.7, 20), mat);
+  body.position.y = 0.85;
+  const head = new THREE.Mesh(new THREE.SphereGeometry(0.3, 24, 16), skin);
+  head.position.y = 1.5;
+
+  const eyeGeo = new THREE.SphereGeometry(0.04, 8, 8);
+  const eyeL = new THREE.Mesh(eyeGeo, dark);
+  eyeL.position.set(-0.1, 1.55, 0.27);
+  const eyeR = new THREE.Mesh(eyeGeo, dark);
+  eyeR.position.set(0.1, 1.55, 0.27);
+
+  const legGeo = new THREE.BoxGeometry(0.16, 0.5, 0.16);
+  legGeo.translate(0, -0.25, 0);
+  const legL = new THREE.Mesh(legGeo, dark);
+  legL.position.set(-0.13, 0.5, 0);
+  const legR = new THREE.Mesh(legGeo, dark);
+  legR.position.set(0.13, 0.5, 0);
+
+  [body, head, legL, legR].forEach((m) => (m.castShadow = true));
+  group.add(body, head, eyeL, eyeR, legL, legR);
+
+  return {
+    group,
+    legL,
+    legR,
+    label: createLabel(layer),
+    labelSig: "",
+    walkPhase: 0,
+    initialized: false,
+    cur: { x: 0, y: 0, z: 0, ry: 0 },
   };
-  return [action, send];
 }
 
-interface ChairStation3D {
-  emptyRing: THREE.Mesh;
-  laptopGroup: THREE.Group;
-  mugGroup: THREE.Group;
-  screenLight: THREE.PointLight;
-  seatWorldX: number;
-  seatWorldZ: number;
-  lookTableRotY: number;
+function updateLabel(rig: AvatarRig, p: PeerState, gesture: string, isMe: boolean) {
+  const sig = `${gesture}|${p.avatar}|${p.name}|${p.status}|${p.goal}|${isMe}`;
+  if (sig === rig.labelSig) return;
+  rig.labelSig = sig;
+  const [g, n, goal] = Array.from(rig.label.children) as HTMLDivElement[];
+  g.textContent = gesture;
+  g.style.visibility = gesture ? "visible" : "hidden";
+  n.textContent = `${p.avatar} ${p.name}${isMe ? " (나)" : ""} · ${p.status === "coding" ? "💻" : "☕"}`;
+  goal.textContent = p.goal;
+  goal.style.display = p.goal ? "block" : "none";
 }
 
-interface AvatarRig3D {
-  root: THREE.Group;
-  bodyGroup: THREE.Group;
-  bodyMesh: THREE.Mesh;
-  headGroup: THREE.Group;
-  leftLeg: THREE.Mesh;
-  rightLeg: THREE.Mesh;
-  leftHand: THREE.Mesh;
-  rightHand: THREE.Mesh;
-  labelAnchor: THREE.Object3D;
-  color: string;
-  jumpVel: number;
-  jumpY: number;
-}
+/* =========================================================
+ * 컴포넌트
+ * ======================================================= */
+export default function Page() {
+  // ── 로비 입력 ──
+  const [roomInput, setRoomInput] = useState("");
+  const [nameInput, setNameInput] = useState("");
+  const [goalInput, setGoalInput] = useState("");
+  const [avatar, setAvatar] = useState(AVATARS[0]);
+  const [color, setColor] = useState(COLORS[0]);
 
-const AVATARS = ["🧑‍💻", "🦊", "🐱", "🦉", "🐼", "🐸", "🤖", "🎧"];
-const CHARACTER_COLORS = [
-  { name: "인디고", hex: "#6366f1" },
-  { name: "에메랄드", hex: "#10b981" },
-  { name: "앰버", hex: "#f59e0b" },
-  { name: "로즈", hex: "#f43f5e" },
-  { name: "스카이", hex: "#0ea5e9" },
-  { name: "바이올렛", hex: "#a855f7" },
-];
-
-const GESTURES = [
-  { emoji: "👋", label: "반가워요" },
-  { emoji: "☕", label: "커피 타임" },
-  { emoji: "🔥", label: "불꽃 코딩" },
-  { emoji: "🎉", label: "버그 해결!" },
-  { emoji: "🫠", label: "뇌 정지..." },
-];
-
-function getSeatTransform(seatIndex: number) {
-  const angle = (seatIndex * 2 * Math.PI) / 6 - Math.PI / 2;
-  const x = Math.cos(angle) * SEAT_RADIUS;
-  const z = Math.sin(angle) * SEAT_RADIUS;
-  const rotY = Math.atan2(-x, -z);
-  return { x, z, rotY, angle };
-}
-
-function disposeObject(obj: THREE.Object3D) {
-  obj.traverse((child) => {
-    const mesh = child as THREE.Mesh;
-    if (mesh.isMesh) {
-      mesh.geometry?.dispose();
-      const mat = mesh.material;
-      if (Array.isArray(mat)) mat.forEach((m) => m.dispose());
-      else mat?.dispose();
-    }
-  });
-}
-
-const nowTime = () =>
-  new Date().toLocaleTimeString("ko-KR", { hour: "2-digit", minute: "2-digit" });
-
-const isSecureEnv = () =>
-  typeof window !== "undefined" && window.isSecureContext && !!globalThis.crypto?.subtle;
-
-export default function Mogakko3DWalkableRoom() {
-  const [myId, setMyId] = useState<string>("");
-  const [initError, setInitError] = useState<string | null>(null);
-  const [reconnectKey, setReconnectKey] = useState<number>(0);
-
-  const [nickname, setNickname] = useState<string>("");
-  const [selectedAvatar, setSelectedAvatar] = useState<string>("🧑‍💻");
-  const [selectedColor, setSelectedColor] = useState<string>("#6366f1");
-  const [task, setTask] = useState<string>("사이드 프로젝트 기능 구현 중");
-  const [joined, setJoined] = useState<boolean>(false);
-  const [mySeat, setMySeat] = useState<number>(-1);
-  const [nearSeat, setNearSeat] = useState<number | null>(null);
-  const [myStatus, setMyStatus] = useState<"coding" | "resting">("coding");
-  const [joinedAt, setJoinedAt] = useState<number>(0);
-
-  const [roomId, setRoomId] = useState<string>("mogakko-3d");
+  // ── 앱 상태 ──
+  const [phase, setPhase] = useState<"lobby" | "room">("lobby");
+  const [hostInfo, setHostInfo] = useState<HostInfo | null>(null);
+  const [hostError, setHostError] = useState<string | null>(null);
+  const [isHttps, setIsHttps] = useState(false);
+  const [conn, setConn] = useState<ConnState>("connecting");
+  const [activeRoom, setActiveRoom] = useState("");
   const [peers, setPeers] = useState<Record<string, PeerState>>({});
-  const [messages, setMessages] = useState<ChatPayload[]>([]);
-  const [inputText, setInputText] = useState<string>("");
-  const [gestures, setGestures] = useState<GesturePayload[]>([]);
-  const [soundOn, setSoundOn] = useState<boolean>(true);
-  const [isConnecting, setIsConnecting] = useState<boolean>(false);
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [chatInput, setChatInput] = useState("");
+  const [status, setStatus] = useState<Status>("coding");
+  const [seatIndex, setSeatIndex] = useState<number | null>(null);
+  const [soundOn, setSoundOn] = useState(true);
+  const [reconnectKey, setReconnectKey] = useState(0);
 
+  // ── refs ──
   const mountRef = useRef<HTMLDivElement | null>(null);
-  const cameraResetRef = useRef<(() => void) | null>(null);
-  const labelElsRef = useRef<Map<string, HTMLDivElement>>(new Map());
+  const labelLayerRef = useRef<HTMLDivElement | null>(null);
+  const chatBoxRef = useRef<HTMLDivElement | null>(null);
 
-  const myPhysicsRef = useRef({
-    x: 0,
-    z: 5.2,
-    rotY: Math.PI,
-    seatIndex: -1,
-    isMoving: false,
-    triggerJump: false,
-  });
-
-  const keysPressedRef = useRef<Record<string, boolean>>({});
   const peersRef = useRef<Record<string, PeerState>>({});
-  const myStateSnapshotRef = useRef<PeerState | null>(null);
-  const gesturesRef = useRef<GesturePayload[]>([]);
-  const pendingJumpsRef = useRef<Set<string>>(new Set());
-
-  const roomRef = useRef<TrysteroRoom | null>(null);
-  const leavingRef = useRef<Promise<unknown> | null>(null); // 이전 방 leave 완료 대기용
-  const sendProfileRef = useRef<SendFn<PeerState> | null>(null);
-  const sendMoveRef = useRef<SendFn<MovePacket> | null>(null);
-  const sendChatRef = useRef<SendFn<ChatPayload> | null>(null);
-  const sendGestureRef = useRef<SendFn<GesturePayload> | null>(null);
-  const chatBottomRef = useRef<HTMLDivElement | null>(null);
-
+  const myProfileRef = useRef<PeerState>({
+    id: "",
+    name: "",
+    goal: "",
+    avatar: AVATARS[0],
+    color: COLORS[0],
+    status: "coding",
+    seatIndex: null,
+    joinedAt: 0,
+  });
+  const sendRef = useRef<((msg: ClientMsg) => void) | null>(null);
+  const remoteMovesRef = useRef<Record<string, MovePacket>>({});
+  const gestureRef = useRef<Record<string, { emoji: string; until: number }>>({});
+  const seatRef = useRef<number | null>(null);
+  const statusRef = useRef<Status>("coding");
+  const localRef = useRef<LocalPlayer>({ x: 0, y: 0, z: 6.2, ry: Math.PI, vy: 0, moving: false });
+  const keysRef = useRef<Set<string>>(new Set());
+  const jumpQueuedRef = useRef(false);
   const soundOnRef = useRef(true);
-  const audioCtxRef = useRef<AudioContext | null>(null);
+  const audioRef = useRef<AudioContext | null>(null);
 
-  // Trystero selfId 로드 + 보안 컨텍스트 확인
-  useEffect(() => {
-    let alive = true;
-    if (!isSecureEnv()) {
-      setInitError("HTTPS(또는 localhost)로 접속해야 P2P 연결이 가능합니다.");
+  const wsPort = hostInfo?.wsPort ?? DEFAULT_WS_PORT;
+
+  /* ── 공용 콜백 (ref/setter만 사용 → 항상 같은 함수) ── */
+  const commitPeers = useCallback((next: Record<string, PeerState>) => {
+    peersRef.current = next;
+    setPeers(next);
+  }, []);
+
+  const pushMessage = useCallback((msg: Omit<ChatMessage, "id">) => {
+    setMessages((prev) => [...prev, { ...msg, id: makeId() }].slice(-MAX_MESSAGES));
+  }, []);
+
+  const addSystemMessage = useCallback(
+    (text: string) => pushMessage({ kind: "system", text }),
+    [pushMessage]
+  );
+
+  const playChime = useCallback(() => {
+    if (!soundOnRef.current) return;
+    try {
+      const Ctx =
+        window.AudioContext ||
+        (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+      if (!audioRef.current) audioRef.current = new Ctx();
+      const ctx = audioRef.current;
+      if (ctx.state === "suspended") void ctx.resume();
+      const t = ctx.currentTime;
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = "sine";
+      osc.frequency.setValueAtTime(587.33, t);
+      osc.frequency.setValueAtTime(880, t + 0.09);
+      gain.gain.setValueAtTime(0.0001, t);
+      gain.gain.exponentialRampToValueAtTime(0.12, t + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.0001, t + 0.35);
+      osc.connect(gain).connect(ctx.destination);
+      osc.start(t);
+      osc.stop(t + 0.4);
+    } catch {
+      /* 오디오 실패는 무시 */
     }
-    import("trystero")
-      .then((m) => {
-        if (alive) setMyId(m.selfId);
+  }, []);
+
+  const placeAtSeat = useCallback((idx: number) => {
+    const t = getSeatTransform(idx);
+    Object.assign(localRef.current, { x: t.x, z: t.z, ry: t.ry, y: 0, vy: 0 });
+    seatRef.current = idx;
+    setSeatIndex(idx);
+  }, []);
+
+  const standUp = useCallback(() => {
+    const idx = seatRef.current;
+    if (idx === null) return;
+    const a = (idx / SEAT_COUNT) * Math.PI * 2;
+    const r = SEAT_RADIUS + 0.9;
+    Object.assign(localRef.current, { x: Math.sin(a) * r, z: Math.cos(a) * r, y: 0, vy: 0 });
+    seatRef.current = null;
+    setSeatIndex(null);
+  }, []);
+
+  const trySit = useCallback(
+    (idx: number) => {
+      const taken = Object.values(peersRef.current).some((p) => p.seatIndex === idx);
+      if (taken) {
+        addSystemMessage("이미 다른 동료가 앉아 있는 자리예요.");
+        return;
+      }
+      placeAtSeat(idx); // 서버가 거절하면 seat-denied로 다시 일어남
+    },
+    [addSystemMessage, placeAtSeat]
+  );
+
+  const leaveRoom = useCallback(
+    (reason?: string) => {
+      if (reason) alert(reason);
+      commitPeers({});
+      remoteMovesRef.current = {};
+      gestureRef.current = {};
+      keysRef.current.clear();
+      seatRef.current = null;
+      setSeatIndex(null);
+      setMessages([]);
+      setPhase("lobby");
+    },
+    [commitPeers]
+  );
+
+  const handleReconnect = useCallback(() => {
+    addSystemMessage("🔄 서버에 다시 연결하는 중...");
+    setReconnectKey((k) => k + 1);
+  }, [addSystemMessage]);
+
+  /* ── 1) 호스트 IP 정보 가져오기 ── */
+  useEffect(() => {
+    setIsHttps(window.location.protocol === "https:");
+    let alive = true;
+    fetch("/__host-info", { cache: "no-store" })
+      .then((r) => {
+        if (!r.ok) throw new Error(String(r.status));
+        return r.json() as Promise<HostInfo>;
       })
-      .catch((err) => {
-        console.error(err);
-        if (alive) setInitError("P2P 모듈을 불러오지 못했습니다. 콘솔을 확인해 주세요.");
+      .then((info) => {
+        if (alive) setHostInfo(info);
+      })
+      .catch(() => {
+        if (alive) {
+          setHostError("호스트 서버 정보를 불러오지 못했어요. server.mjs(npm run dev / npm start)로 실행했는지 확인해 주세요.");
+        }
       });
     return () => {
       alive = false;
     };
   }, []);
 
+  /* ── 2) 내 좌석/상태가 바뀌면 서버에 알림 ── */
   useEffect(() => {
-    soundOnRef.current = soundOn;
-  }, [soundOn]);
+    myProfileRef.current = { ...myProfileRef.current, seatIndex };
+    sendRef.current?.({ t: "seat", seatIndex });
+  }, [seatIndex]);
 
+  useEffect(() => {
+    myProfileRef.current = { ...myProfileRef.current, status };
+    sendRef.current?.({ t: "status", status });
+  }, [status]);
+
+  /* ── 3) 채팅 자동 스크롤 ── */
+  useEffect(() => {
+    const box = chatBoxRef.current;
+    if (box) box.scrollTop = box.scrollHeight;
+  }, [messages]);
+
+  /* ── 4) 언마운트 시 오디오 정리 ── */
   useEffect(() => {
     return () => {
-      void audioCtxRef.current?.close().catch(() => {});
+      void audioRef.current?.close().catch(() => {});
     };
   }, []);
 
-  const commitPeers = useCallback((next: Record<string, PeerState>) => {
-    peersRef.current = next;
-    setPeers(next);
-  }, []);
+  /* ── 5) WebSocket 연결 (끊기면 자동 재연결) ── */
+  useEffect(() => {
+    if (phase !== "room" || !activeRoom) return;
 
-  const playChime = useCallback(() => {
-    if (!soundOnRef.current || typeof window === "undefined") return;
-    try {
-      if (!audioCtxRef.current) {
-        const Ctx =
-          window.AudioContext ||
-          (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
-        if (!Ctx) return;
-        audioCtxRef.current = new Ctx();
-      }
-      const ctx = audioCtxRef.current;
-      if (ctx.state === "suspended") void ctx.resume().catch(() => {});
-      const t = ctx.currentTime;
-      const osc = new OscillatorNode(ctx, { type: "sine", frequency: 587.33 });
-      const gain = new GainNode(ctx, { gain: 0.08 });
-      osc.frequency.exponentialRampToValueAtTime(880, t + 0.15);
-      gain.gain.setValueAtTime(0.08, t);
-      gain.gain.exponentialRampToValueAtTime(0.001, t + 0.8);
-      osc.connect(gain).connect(ctx.destination);
-      osc.start(t);
-      osc.stop(t + 0.8);
-    } catch {
-      // 자동재생 정책 등으로 차단 시 무시
-    }
-  }, []);
+    let cancelled = false;
+    let kicked = false;
+    let everConnected = false;
+    let retry = 0;
+    let sock: WebSocket | null = null;
+    let retryTimer: ReturnType<typeof setTimeout> | null = null;
 
-  const appendSystemMessage = useCallback((text: string) => {
-    setMessages((prev) => [
-      ...prev.slice(-99),
-      {
-        id: `sys_${Date.now()}_${Math.random()}`,
-        senderId: "system",
-        nickname: "모각코봇",
-        avatar: "💻",
-        text,
-        timestamp: nowTime(),
-        isSystem: true,
-      },
-    ]);
-  }, []);
+    const connect = () => {
+      if (cancelled) return;
+      setConn("connecting");
 
-  const triggerFloatingGesture = useCallback(
-    (payload: GesturePayload) => {
-      setGestures((prev) => {
-        const next = [...prev, payload];
-        gesturesRef.current = next;
-        return next;
-      });
-      if (payload.emoji === "👋") playChime();
-      window.setTimeout(() => {
-        setGestures((prev) => {
-          const next = prev.filter((g) => g.id !== payload.id);
-          gesturesRef.current = next;
-          return next;
+      const proto = window.location.protocol === "https:" ? "wss" : "ws";
+      const ws = new WebSocket(`${proto}://${window.location.hostname}:${wsPort}`);
+      sock = ws;
+
+      const send = (msg: ClientMsg) => {
+        if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
+      };
+
+      ws.onopen = () => {
+        const me = myProfileRef.current;
+        send({
+          t: "join",
+          room: activeRoom,
+          profile: {
+            name: me.name,
+            goal: me.goal,
+            avatar: me.avatar,
+            color: me.color,
+            status: statusRef.current,
+            seatIndex: seatRef.current,
+          },
         });
-      }, 2800);
-    },
-    [playChime]
-  );
+      };
 
-  const sitOnSeat = useCallback((seatIdx: number) => {
-    const occupied = Object.values(peersRef.current).some((p) => p.seatIndex === seatIdx);
-    if (occupied) return;
-    const { x, z, rotY } = getSeatTransform(seatIdx);
-    const phys = myPhysicsRef.current;
-    phys.seatIndex = seatIdx;
-    phys.x = x;
-    phys.z = z;
-    phys.rotY = rotY;
-    phys.isMoving = false;
-    setMySeat(seatIdx);
-    setNearSeat(null);
-  }, []);
-
-  const standUpFromSeat = useCallback(() => {
-    const phys = myPhysicsRef.current;
-    if (phys.seatIndex === -1) return;
-    const { angle } = getSeatTransform(phys.seatIndex);
-    phys.x = Math.cos(angle) * (SEAT_RADIUS + 1.05);
-    phys.z = Math.sin(angle) * (SEAT_RADIUS + 1.05);
-    phys.rotY = angle + Math.PI / 2;
-    phys.seatIndex = -1;
-    setMySeat(-1);
-  }, []);
-
-  // 실제 room.leave()는 P2P effect cleanup에서 한 번만 수행
-  const handleLeaveRoom = useCallback(() => {
-    myPhysicsRef.current.seatIndex = -1;
-    pendingJumpsRef.current.clear();
-    setMySeat(-1);
-    setNearSeat(null);
-    setJoined(false);
-    commitPeers({});
-  }, [commitPeers]);
-
-  // 새로고침 없이 P2P만 다시 연결
-  const handleReconnect = useCallback(() => {
-    commitPeers({});
-    pendingJumpsRef.current.clear();
-    setReconnectKey((k) => k + 1);
-  }, [commitPeers]);
-
-  // 내 프로필 변경 시 브로드캐스트
-  useEffect(() => {
-    if (!joined || !myId) return;
-    const phys = myPhysicsRef.current;
-    const snapshot: PeerState = {
-      peerId: myId,
-      nickname,
-      avatar: selectedAvatar,
-      color: selectedColor,
-      seatIndex: mySeat,
-      x: phys.x,
-      z: phys.z,
-      rotY: phys.rotY,
-      isMoving: phys.isMoving,
-      status: myStatus,
-      task,
-      joinedAt,
-    };
-    myStateSnapshotRef.current = snapshot;
-    sendProfileRef.current?.(snapshot);
-  }, [joined, myId, nickname, selectedAvatar, selectedColor, mySeat, myStatus, task, joinedAt]);
-
-  // 정원 제한 및 좌석 충돌 시 늦게 온 사람이 양보
-  useEffect(() => {
-    if (!joined || !myId) return;
-    const peerList = Object.values(peers);
-
-    if (peerList.length >= MAX_PLAYERS) {
-      const all = [
-        ...peerList.map((p) => ({ t: p.joinedAt, id: p.peerId })),
-        { t: joinedAt, id: myId },
-      ].sort((a, b) => a.t - b.t || a.id.localeCompare(b.id));
-      const allowed = new Set(all.slice(0, MAX_PLAYERS).map((e) => e.id));
-      if (!allowed.has(myId)) {
-        window.alert(
-          `현재 이 모각코룸의 최대 인원(${MAX_PLAYERS}명)이 모두 찼습니다. 다른 룸 이름을 입력해 주세요!`
-        );
-        handleLeaveRoom();
-        return;
-      }
-    }
-
-    if (mySeat !== -1) {
-      const conflict = peerList.find((p) => p.seatIndex === mySeat);
-      if (conflict) {
-        const shouldYield =
-          joinedAt > conflict.joinedAt ||
-          (joinedAt === conflict.joinedAt && myId > conflict.peerId);
-        if (shouldYield) {
-          const taken = new Set(peerList.map((p) => p.seatIndex));
-          const free = [0, 1, 2, 3, 4, 5].find((s) => !taken.has(s));
-          if (free !== undefined) {
-            myPhysicsRef.current.seatIndex = -1;
-            sitOnSeat(free);
-          } else {
-            standUpFromSeat();
-          }
-        }
-      }
-    }
-  }, [peers, mySeat, joined, joinedAt, myId, handleLeaveRoom, sitOnSeat, standUpFromSeat]);
-
-  // 키보드 입력
-  useEffect(() => {
-    if (!joined) return;
-
-    const isTypingInInput = () => {
-      const el = document.activeElement as HTMLElement | null;
-      return !!el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.isContentEditable);
-    };
-
-    const MOVE_KEYS = new Set([
-      "KeyW", "KeyA", "KeyS", "KeyD", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight",
-    ]);
-
-    const onKeyDown = (e: KeyboardEvent) => {
-      if (isTypingInInput()) return;
-      const code = e.code;
-
-      if (MOVE_KEYS.has(code)) {
-        e.preventDefault();
-        keysPressedRef.current[code] = true;
-        if (myPhysicsRef.current.seatIndex !== -1) standUpFromSeat();
-      } else if (code === "Space") {
-        e.preventDefault();
-        if (e.repeat) return;
-        if (myPhysicsRef.current.seatIndex !== -1) standUpFromSeat();
-        myPhysicsRef.current.triggerJump = true;
-      } else if (code === "KeyE") {
-        if (e.repeat) return;
-        if (myPhysicsRef.current.seatIndex !== -1) {
-          standUpFromSeat();
+      ws.onmessage = (ev) => {
+        if (cancelled) return;
+        let msg: ServerMsg;
+        try {
+          msg = JSON.parse(String(ev.data)) as ServerMsg;
+        } catch {
           return;
         }
-        let closestSeat: number | null = null;
-        let minDist = 1.65;
-        const occupied = new Set(Object.values(peersRef.current).map((p) => p.seatIndex));
-        for (let i = 0; i < 6; i++) {
-          if (occupied.has(i)) continue;
-          const st = getSeatTransform(i);
-          const d = Math.hypot(myPhysicsRef.current.x - st.x, myPhysicsRef.current.z - st.z);
-          if (d < minDist) {
-            minDist = d;
-            closestSeat = i;
-          }
-        }
-        if (closestSeat !== null) sitOnSeat(closestSeat);
-      }
-    };
 
-    const onKeyUp = (e: KeyboardEvent) => {
-      keysPressedRef.current[e.code] = false;
-    };
-    const onBlur = () => {
-      keysPressedRef.current = {};
-    };
+        switch (msg.t) {
+          case "welcome": {
+            myProfileRef.current = { ...myProfileRef.current, id: msg.id, joinedAt: msg.you.joinedAt };
+            const map: Record<string, PeerState> = {};
+            for (const p of msg.peers) map[p.id] = p;
+            commitPeers(map);
+            remoteMovesRef.current = {};
 
-    window.addEventListener("keydown", onKeyDown);
-    window.addEventListener("keyup", onKeyUp);
-    window.addEventListener("blur", onBlur);
-    return () => {
-      window.removeEventListener("keydown", onKeyDown);
-      window.removeEventListener("keyup", onKeyUp);
-      window.removeEventListener("blur", onBlur);
-      keysPressedRef.current = {};
-    };
-  }, [joined, sitOnSeat, standUpFromSeat]);
-
-  // ==========================================================================
-  // P2P 룸 연결 (Trystero 0.26, 공개 Nostr 릴레이)
-  // ==========================================================================
-  useEffect(() => {
-    if (!joined || !myId) return;
-
-    let active = true;
-    let room: TrysteroRoom | null = null;
-    let aloneTimer: number | undefined;
-    const roomName = roomId.trim();
-    setIsConnecting(true);
-
-    if (!isSecureEnv()) {
-      setIsConnecting(false);
-      appendSystemMessage(
-        "⚠️ 보안 연결(HTTPS)이 아니라 P2P 연결이 불가능합니다. https 주소(배포 사이트)로 접속해 주세요."
-      );
-      return;
-    }
-
-    const connect = async () => {
-      try {
-        // 직전 방의 leave가 끝날 때까지 대기 (빠른 재연결 시 꼬임 방지)
-        if (leavingRef.current) {
-          await leavingRef.current.catch(() => {});
-          leavingRef.current = null;
-        }
-
-        const { joinRoom } = (await import("trystero")) as unknown as { joinRoom: JoinRoomFn };
-        if (!active) return;
-
-        room = joinRoom(
-          { appId: APP_ID, relayConfig: { redundancy: RELAY_REDUNDANCY } },
-          roomName,
-          {
-            onJoinError: ({ peerId, error }) => {
-              console.warn("[P2P] join error", peerId, error);
-              if (active) {
-                appendSystemMessage(
-                  "⚠️ 참여자를 찾았지만 직접 연결에 실패했습니다. 🔄 재연결을 눌러보세요. (회사망/VPN 제한일 수 있어요)"
-                );
+            if (msg.you.seatIndex !== seatRef.current) {
+              if (msg.you.seatIndex === null) {
+                standUp();
+                addSystemMessage("앉아 있던 자리를 다른 동료가 쓰고 있어서 일어났어요.");
+              } else {
+                placeAtSeat(msg.you.seatIndex);
               }
-            },
-          }
-        ) as TrysteroRoom;
-        roomRef.current = room;
+            }
 
-        const [profileAction, sendProfile] = createAction<PeerState>(room, "profile");
-        const [moveAction, sendMove] = createAction<MovePacket>(room, "move");
-        const [chatAction, sendChat] = createAction<ChatPayload>(room, "chat");
-        const [gestureAction, sendGesture] = createAction<GesturePayload>(room, "gesture");
-
-        sendProfileRef.current = sendProfile;
-        sendMoveRef.current = sendMove;
-        sendChatRef.current = sendChat;
-        sendGestureRef.current = sendGesture;
-
-        profileAction.onMessage = (data, { peerId }) => {
-          const prev = peersRef.current;
-          if (!prev[peerId]) {
-            appendSystemMessage(`${data.avatar} ${data.nickname}님이 모각코룸에 들어왔습니다.`);
-          }
-          commitPeers({ ...prev, [peerId]: { ...data, peerId } });
-        };
-
-        moveAction.onMessage = (pkt, { peerId }) => {
-          const prev = peersRef.current;
-          const existing = prev[peerId];
-          if (!existing) return;
-          const next = {
-            ...prev,
-            [peerId]: {
-              ...existing,
-              seatIndex: pkt.seatIndex,
-              x: pkt.x,
-              z: pkt.z,
-              rotY: pkt.rotY,
-              isMoving: pkt.isMoving,
-            },
-          };
-          if (existing.seatIndex !== pkt.seatIndex) commitPeers(next);
-          else peersRef.current = next;
-          if (pkt.jump) pendingJumpsRef.current.add(peerId);
-        };
-
-        chatAction.onMessage = (data, { peerId }) => {
-          setMessages((prev) => [
-            ...prev.slice(-99),
-            { ...data, senderId: peerId, text: String(data.text).slice(0, 500), isSystem: false },
-          ]);
-        };
-
-        gestureAction.onMessage = (data, { peerId }) => {
-          triggerFloatingGesture({ ...data, peerId });
-        };
-
-        room.onPeerJoin = (peerId) => {
-          if (myStateSnapshotRef.current) {
-            const phys = myPhysicsRef.current;
-            sendProfile(
-              {
-                ...myStateSnapshotRef.current,
-                seatIndex: phys.seatIndex,
-                x: phys.x,
-                z: phys.z,
-                rotY: phys.rotY,
-              },
-              peerId
+            sendRef.current = send;
+            retry = 0;
+            setConn("open");
+            addSystemMessage(
+              everConnected
+                ? "서버에 다시 연결되었습니다."
+                : `서버에 연결되었습니다. 현재 ${msg.peers.length + 1}명이 있어요.`
             );
+            everConnected = true;
+            break;
           }
-          playChime();
-        };
 
-        room.onPeerLeave = (peerId) => {
-          const prev = peersRef.current;
-          const leaving = prev[peerId];
-          if (leaving) {
-            appendSystemMessage(`${leaving.avatar} ${leaving.nickname}님이 퇴장했습니다.`);
-            const next = { ...prev };
-            delete next[peerId];
+          case "full":
+            kicked = true;
+            leaveRoom(`현재 이 모각코룸의 최대 인원(${msg.max}명)이 모두 찼습니다. 다른 룸 이름을 입력해 주세요!`);
+            break;
+
+          case "peer-join":
+            commitPeers({ ...peersRef.current, [msg.peer.id]: msg.peer });
+            addSystemMessage(`${msg.peer.avatar} ${msg.peer.name}님이 모각코룸에 들어왔습니다.`);
+            playChime();
+            break;
+
+          case "peer-leave": {
+            const leaving = peersRef.current[msg.id];
+            delete remoteMovesRef.current[msg.id];
+            delete gestureRef.current[msg.id];
+            if (!leaving) break;
+            const next = { ...peersRef.current };
+            delete next[msg.id];
             commitPeers(next);
+            addSystemMessage(`${leaving.avatar} ${leaving.name}님이 모각코룸에서 나갔습니다.`);
+            break;
           }
-          pendingJumpsRef.current.delete(peerId);
-        };
 
-        setIsConnecting(false);
-        appendSystemMessage(
-          `'${roomName}' 3D 모각코룸에 입장했습니다! WASD(방향키)로 걸어 다니고, 의자를 클릭하거나 [E] 키를 눌러 착석해 보세요.`
-        );
+          case "peer-update":
+            if (!peersRef.current[msg.peer.id]) break;
+            commitPeers({ ...peersRef.current, [msg.peer.id]: msg.peer });
+            break;
 
-        aloneTimer = window.setTimeout(() => {
-          if (active && Object.keys(peersRef.current).length === 0) {
-            appendSystemMessage(
-              "아직 다른 참여자가 보이지 않아요. 동료가 같은 방 이름으로 입장했다면 상단 🔄 버튼으로 재연결해 보세요."
-            );
+          case "seat-denied":
+            if (seatRef.current === msg.seatIndex) {
+              standUp();
+              addSystemMessage("간발의 차로 다른 동료가 먼저 앉았어요.");
+            }
+            break;
+
+          case "move":
+            remoteMovesRef.current[msg.id] = {
+              x: msg.x,
+              y: msg.y,
+              z: msg.z,
+              ry: msg.ry,
+              moving: msg.moving,
+            };
+            break;
+
+          case "chat": {
+            const p = peersRef.current[msg.id];
+            pushMessage({
+              kind: "chat",
+              text: msg.text,
+              name: p?.name ?? "동료",
+              avatar: p?.avatar ?? "👤",
+              color: p?.color ?? "#94a3b8",
+            });
+            playChime();
+            break;
           }
-        }, ALONE_HINT_MS);
-      } catch (err) {
-        console.error(err);
-        if (active) {
-          setIsConnecting(false);
-          appendSystemMessage("P2P 연결에 실패했습니다. 🔄 버튼으로 다시 시도해 주세요.");
+
+          case "gesture":
+            gestureRef.current[msg.id] = { emoji: msg.emoji, until: Date.now() + GESTURE_MS };
+            break;
         }
-      }
+      };
+
+      ws.onclose = () => {
+        if (sock === ws) sock = null;
+        sendRef.current = null;
+        if (cancelled || kicked) return;
+
+        setConn("closed");
+        commitPeers({});
+        remoteMovesRef.current = {};
+
+        if (retry === 0) {
+          addSystemMessage(
+            everConnected
+              ? "서버와 연결이 끊겼습니다. 다시 연결하는 중..."
+              : "서버에 연결할 수 없어요. 호스트 PC에서 server.mjs가 켜져 있는지, 방화벽에서 3001 포트가 허용됐는지 확인해 주세요."
+          );
+        }
+        const delay = Math.min(1000 * 2 ** retry, 10000);
+        retry += 1;
+        retryTimer = setTimeout(connect, delay);
+      };
     };
 
-    void connect();
+    connect();
 
     return () => {
-      active = false;
-      window.clearTimeout(aloneTimer);
-      if (room) {
-        room.onPeerJoin = null;
-        room.onPeerLeave = null;
-        try {
-          leavingRef.current = Promise.resolve(room.leave());
-        } catch {
-          /* noop */
-        }
+      cancelled = true;
+      if (retryTimer) clearTimeout(retryTimer);
+      sendRef.current = null;
+      if (sock) {
+        sock.onclose = null;
+        sock.close();
+        sock = null;
       }
-      if (roomRef.current === room) roomRef.current = null;
-      sendProfileRef.current = null;
-      sendMoveRef.current = null;
-      sendChatRef.current = null;
-      sendGestureRef.current = null;
     };
-  }, [joined, roomId, myId, reconnectKey, appendSystemMessage, playChime, triggerFloatingGesture, commitPeers]);
+  }, [
+    phase,
+    activeRoom,
+    wsPort,
+    reconnectKey,
+    addSystemMessage,
+    commitPeers,
+    leaveRoom,
+    placeAtSeat,
+    playChime,
+    pushMessage,
+    standUp,
+  ]);
 
-  // ==========================================================================
-  // Three.js 월드 + 물리 + 렌더 루프
-  // ==========================================================================
+  /* ── 6) 3D 월드 ── */
   useEffect(() => {
-    if (!joined || !mountRef.current || !myId) return;
+    if (phase !== "room") return;
+    const mount = mountRef.current;
+    const labelLayer = labelLayerRef.current;
+    if (!mount || !labelLayer) return;
 
-    const container = mountRef.current;
-    let viewW = container.clientWidth || 1;
-    let viewH = container.clientHeight || 1;
+    let width = Math.max(1, mount.clientWidth);
+    let height = Math.max(1, mount.clientHeight);
 
-    const scene = new THREE.Scene();
-    scene.background = new THREE.Color("#090d16");
-    scene.fog = new THREE.FogExp2("#090d16", 0.038);
-
-    const camera = new THREE.PerspectiveCamera(46, viewW / viewH, 0.1, 100);
-    camera.position.set(0, 7.2, 9.8);
-
-    const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: "high-performance" });
-    renderer.setSize(viewW, viewH);
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.setSize(width, height);
     renderer.shadowMap.enabled = true;
     renderer.shadowMap.type = THREE.PCFShadowMap;
-    container.appendChild(renderer.domElement);
+    mount.appendChild(renderer.domElement);
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color("#1e1b2e");
+    scene.fog = new THREE.Fog("#1e1b2e", 16, 32);
+
+    const me0 = localRef.current;
+    const camera = new THREE.PerspectiveCamera(55, width / height, 0.1, 100);
+    camera.position.set(me0.x, 6, me0.z + 7);
 
     const controls = new OrbitControls(camera, renderer.domElement);
     controls.enableDamping = true;
-    controls.dampingFactor = 0.06;
-    controls.target.set(0, 1.0, 0);
-    controls.minDistance = 4.2;
-    controls.maxDistance = 16.5;
-    controls.maxPolarAngle = Math.PI / 2 - 0.05;
+    controls.enablePan = false;
+    controls.minDistance = 3;
+    controls.maxDistance = 18;
+    controls.maxPolarAngle = Math.PI * 0.47;
+    controls.target.set(me0.x, 1, me0.z);
+    controls.update();
 
-    cameraResetRef.current = () => {
-      camera.position.set(0, 7.2, 9.8);
-      controls.target.set(0, 1.0, 0);
-      controls.update();
-    };
+    // 조명
+    scene.add(new THREE.HemisphereLight("#ffffff", "#3b3355", 0.9));
+    const sun = new THREE.DirectionalLight("#ffffff", 1.4);
+    sun.position.set(6, 12, 5);
+    sun.castShadow = true;
+    sun.shadow.mapSize.set(1024, 1024);
+    Object.assign(sun.shadow.camera, { left: -10, right: 10, top: 10, bottom: -10, near: 1, far: 30 });
+    scene.add(sun);
 
-    scene.add(new THREE.AmbientLight("#94a3b8", 0.7));
-
-    const dirLight = new THREE.DirectionalLight("#e0e7ff", 1.15);
-    dirLight.position.set(6, 13, 7);
-    dirLight.castShadow = true;
-    dirLight.shadow.mapSize.set(1024, 1024);
-    dirLight.shadow.camera.left = -10;
-    dirLight.shadow.camera.right = 10;
-    dirLight.shadow.camera.top = 10;
-    dirLight.shadow.camera.bottom = -10;
-    scene.add(dirLight);
-
-    const centerWarmLight = new THREE.PointLight("#fbbf24", 2.3, 11);
-    centerWarmLight.position.set(0, 2.1, 0);
-    scene.add(centerWarmLight);
-
+    // 바닥/벽
+    const size = ROOM_BOUNDARY * 2 + 2;
     const floor = new THREE.Mesh(
-      new THREE.CircleGeometry(ROOM_BOUNDARY + 0.6, 64),
-      new THREE.MeshStandardMaterial({ color: "#0f172a", roughness: 0.88 })
+      new THREE.PlaneGeometry(size, size),
+      new THREE.MeshStandardMaterial({ color: "#3a3450", roughness: 0.9 })
     );
     floor.rotation.x = -Math.PI / 2;
     floor.receiveShadow = true;
     scene.add(floor);
 
-    const outerRing = new THREE.Mesh(
-      new THREE.RingGeometry(ROOM_BOUNDARY - 0.08, ROOM_BOUNDARY, 64),
-      new THREE.MeshBasicMaterial({ color: "#334155", side: THREE.DoubleSide, transparent: true, opacity: 0.5 })
-    );
-    outerRing.rotation.x = -Math.PI / 2;
-    outerRing.position.y = 0.015;
-    scene.add(outerRing);
+    const grid = new THREE.GridHelper(size, 18, "#5b5280", "#4a4366");
+    grid.position.y = 0.01;
+    scene.add(grid);
 
-    const rug = new THREE.Mesh(
-      new THREE.CylinderGeometry(4.75, 4.75, 0.03, 64),
-      new THREE.MeshStandardMaterial({ color: "#1e1b4b", roughness: 0.85 })
-    );
-    rug.position.y = 0.015;
-    rug.receiveShadow = true;
-    scene.add(rug);
-
-    const tableGroup = new THREE.Group();
-    const tableTop = new THREE.Mesh(
-      new THREE.CylinderGeometry(2.35, 2.25, 0.16, 48),
-      new THREE.MeshStandardMaterial({ color: "#3b281e", roughness: 0.55, metalness: 0.1 })
-    );
-    tableTop.position.y = 1.05;
-    tableTop.castShadow = true;
-    tableTop.receiveShadow = true;
-    tableGroup.add(tableTop);
-
-    const tablePedestal = new THREE.Mesh(
-      new THREE.CylinderGeometry(0.42, 0.75, 1.0, 32),
-      new THREE.MeshStandardMaterial({ color: "#1e293b", roughness: 0.5, metalness: 0.4 })
-    );
-    tablePedestal.position.y = 0.5;
-    tablePedestal.castShadow = true;
-    tableGroup.add(tablePedestal);
-
-    const crystalMesh = new THREE.Mesh(
-      new THREE.OctahedronGeometry(0.24, 0),
-      new THREE.MeshStandardMaterial({ color: "#fbbf24", emissive: "#f59e0b", emissiveIntensity: 0.85, roughness: 0.2 })
-    );
-    crystalMesh.position.y = 1.52;
-    tableGroup.add(crystalMesh);
-    scene.add(tableGroup);
-
-    const chairStations: ChairStation3D[] = [];
-    const clickableChairs: THREE.Mesh[] = [];
-
-    for (let i = 0; i < 6; i++) {
-      const { x, z, rotY } = getSeatTransform(i);
-      const stationGroup = new THREE.Group();
-      stationGroup.position.set(x, 0, z);
-      stationGroup.rotation.y = rotY;
-
-      const cushionMat = new THREE.MeshStandardMaterial({ color: "#334155", roughness: 0.7 });
-      const cushionMesh = new THREE.Mesh(new THREE.CylinderGeometry(0.5, 0.46, 0.13, 24), cushionMat);
-      cushionMesh.position.y = 0.52;
-      cushionMesh.castShadow = true;
-      cushionMesh.receiveShadow = true;
-      cushionMesh.userData = { seatIndex: i };
-      stationGroup.add(cushionMesh);
-      clickableChairs.push(cushionMesh);
-
-      const leg = new THREE.Mesh(
-        new THREE.CylinderGeometry(0.09, 0.26, 0.48, 16),
-        new THREE.MeshStandardMaterial({ color: "#1e293b", metalness: 0.5 })
-      );
-      leg.position.y = 0.24;
-      stationGroup.add(leg);
-
-      const backRest = new THREE.Mesh(new THREE.BoxGeometry(0.68, 0.5, 0.1), cushionMat);
-      backRest.position.set(0, 0.86, -0.42);
-      backRest.castShadow = true;
-      stationGroup.add(backRest);
-
-      const emptyRing = new THREE.Mesh(
-        new THREE.RingGeometry(0.56, 0.65, 32),
-        new THREE.MeshBasicMaterial({ color: "#38bdf8", side: THREE.DoubleSide, transparent: true, opacity: 0.4 })
-      );
-      emptyRing.rotation.x = -Math.PI / 2;
-      emptyRing.position.y = 0.03;
-      stationGroup.add(emptyRing);
-
-      const laptopGroup = new THREE.Group();
-      laptopGroup.position.set(0, 1.14, 1.42);
-      const laptopMetal = new THREE.MeshStandardMaterial({ color: "#94a3b8", metalness: 0.7, roughness: 0.3 });
-      laptopGroup.add(new THREE.Mesh(new THREE.BoxGeometry(0.6, 0.03, 0.4), laptopMetal));
-
-      const lidPivot = new THREE.Group();
-      lidPivot.position.set(0, 0.015, 0.2);
-      lidPivot.rotation.x = -0.35;
-      const lidMesh = new THREE.Mesh(new THREE.BoxGeometry(0.6, 0.38, 0.025), laptopMetal);
-      lidMesh.position.set(0, 0.19, 0);
-      lidPivot.add(lidMesh);
-      const screenMesh = new THREE.Mesh(
-        new THREE.PlaneGeometry(0.54, 0.32),
-        new THREE.MeshBasicMaterial({ color: "#38bdf8" })
-      );
-      screenMesh.position.set(0, 0.19, -0.015);
-      screenMesh.rotation.y = Math.PI;
-      lidPivot.add(screenMesh);
-      laptopGroup.add(lidPivot);
-      stationGroup.add(laptopGroup);
-
-      // 조명 개수가 변하면 셰이더가 재컴파일되므로 항상 씬에 두고 intensity만 조절
-      const screenLight = new THREE.PointLight("#38bdf8", 0, 2.2);
-      screenLight.position.set(0, 1.39, 1.27);
-      stationGroup.add(screenLight);
-
-      const mugGroup = new THREE.Group();
-      mugGroup.position.set(0, 1.22, 1.38);
-      mugGroup.add(
-        new THREE.Mesh(
-          new THREE.CylinderGeometry(0.1, 0.085, 0.19, 16),
-          new THREE.MeshStandardMaterial({ color: "#f8fafc", roughness: 0.3 })
-        )
-      );
-      stationGroup.add(mugGroup);
-
-      scene.add(stationGroup);
-      chairStations.push({
-        emptyRing,
-        laptopGroup,
-        mugGroup,
-        screenLight,
-        seatWorldX: x,
-        seatWorldZ: z,
-        lookTableRotY: rotY,
-      });
+    const wallMat = new THREE.MeshStandardMaterial({ color: "#2b2640" });
+    const walls: Array<[number, number, number]> = [
+      [0, -size / 2, 0],
+      [0, size / 2, 0],
+      [-size / 2, 0, Math.PI / 2],
+      [size / 2, 0, Math.PI / 2],
+    ];
+    for (const [x, z, ry] of walls) {
+      const wall = new THREE.Mesh(new THREE.BoxGeometry(size, 1.2, 0.2), wallMat);
+      wall.position.set(x, 0.6, z);
+      wall.rotation.y = ry;
+      wall.receiveShadow = true;
+      scene.add(wall);
     }
 
-    const avatarRigs = new Map<string, AvatarRig3D>();
+    // 테이블
+    const table = new THREE.Mesh(
+      new THREE.CylinderGeometry(TABLE_RADIUS, TABLE_RADIUS, 0.12, 48),
+      new THREE.MeshStandardMaterial({ color: "#8b5e3c", roughness: 0.7 })
+    );
+    table.position.y = 0.78;
+    table.castShadow = true;
+    table.receiveShadow = true;
+    scene.add(table);
+    const tableLeg = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.25, 0.4, 0.78, 16),
+      new THREE.MeshStandardMaterial({ color: "#5a3d28" })
+    );
+    tableLeg.position.y = 0.39;
+    scene.add(tableLeg);
 
-    const createAvatarRig = (colorHex: string): AvatarRig3D => {
-      const root = new THREE.Group();
-      const bodyGroup = new THREE.Group();
-      root.add(bodyGroup);
-
-      const skinMat = new THREE.MeshStandardMaterial({ color: "#fde68a", roughness: 0.55 });
-      const pantsMat = new THREE.MeshStandardMaterial({ color: "#1e293b", roughness: 0.7 });
-      const bodyMat = new THREE.MeshStandardMaterial({ color: colorHex, roughness: 0.6 });
-
-      const legGeo = new THREE.CylinderGeometry(0.095, 0.085, 0.46, 12);
-      const leftLeg = new THREE.Mesh(legGeo, pantsMat);
-      leftLeg.position.set(0.13, 0.23, 0);
-      leftLeg.castShadow = true;
-      const rightLeg = new THREE.Mesh(legGeo, pantsMat);
-      rightLeg.position.set(-0.13, 0.23, 0);
-      rightLeg.castShadow = true;
-      bodyGroup.add(leftLeg, rightLeg);
-
-      const bodyMesh = new THREE.Mesh(new THREE.CylinderGeometry(0.26, 0.33, 0.62, 20), bodyMat);
-      bodyMesh.position.y = 0.72;
-      bodyMesh.castShadow = true;
-      bodyGroup.add(bodyMesh);
-
-      const headGroup = new THREE.Group();
-      headGroup.position.set(0, 1.28, 0);
-      const headMesh = new THREE.Mesh(new THREE.SphereGeometry(0.29, 24, 24), skinMat);
-      headMesh.castShadow = true;
-      headGroup.add(headMesh);
-
-      const eyeGeo = new THREE.SphereGeometry(0.04, 12, 12);
-      const eyeMat = new THREE.MeshBasicMaterial({ color: "#0f172a" });
-      const leftEye = new THREE.Mesh(eyeGeo, eyeMat);
-      leftEye.position.set(0.1, 0.04, 0.25);
-      const rightEye = new THREE.Mesh(eyeGeo, eyeMat);
-      rightEye.position.set(-0.1, 0.04, 0.25);
-      headGroup.add(leftEye, rightEye);
-
-      const headsetMat = new THREE.MeshStandardMaterial({ color: "#0f172a", roughness: 0.3 });
-      headGroup.add(new THREE.Mesh(new THREE.TorusGeometry(0.3, 0.028, 12, 24, Math.PI), headsetMat));
-      const earGeo = new THREE.CylinderGeometry(0.085, 0.085, 0.07, 16);
-      const leftEar = new THREE.Mesh(earGeo, headsetMat);
-      leftEar.rotation.z = Math.PI / 2;
-      leftEar.position.set(0.3, 0, 0);
-      const rightEar = new THREE.Mesh(earGeo, headsetMat);
-      rightEar.rotation.z = Math.PI / 2;
-      rightEar.position.set(-0.3, 0, 0);
-      headGroup.add(leftEar, rightEar);
-      bodyGroup.add(headGroup);
-
-      const handGeo = new THREE.SphereGeometry(0.08, 14, 14);
-      const leftHand = new THREE.Mesh(handGeo, skinMat);
-      const rightHand = new THREE.Mesh(handGeo, skinMat);
-      leftHand.position.set(0.34, 0.72, 0.1);
-      rightHand.position.set(-0.34, 0.72, 0.1);
-      bodyGroup.add(leftHand, rightHand);
-
-      const labelAnchor = new THREE.Object3D();
-      labelAnchor.position.set(0, 1.92, 0);
-      bodyGroup.add(labelAnchor);
-
-      scene.add(root);
-      return {
-        root, bodyGroup, bodyMesh, headGroup, leftLeg, rightLeg, leftHand, rightHand, labelAnchor,
-        color: colorHex, jumpVel: 0, jumpY: 0,
-      };
+    // 의자 + 노트북 스테이션
+    type Station = {
+      ring: THREE.Mesh;
+      ringMat: THREE.MeshBasicMaterial;
+      light: THREE.PointLight;
+      screenMat: THREE.MeshStandardMaterial;
     };
+    const stations: Station[] = [];
+    const clickables: THREE.Object3D[] = [];
+    const chairMat = new THREE.MeshStandardMaterial({ color: "#475569", roughness: 0.6 });
+    const laptopMat = new THREE.MeshStandardMaterial({ color: "#cbd5e1", metalness: 0.3, roughness: 0.4 });
+    const mugMat = new THREE.MeshStandardMaterial({ color: "#f8fafc" });
+
+    for (let i = 0; i < SEAT_COUNT; i++) {
+      const t = getSeatTransform(i);
+      const a = (i / SEAT_COUNT) * Math.PI * 2;
+
+      const chair = new THREE.Group();
+      chair.position.set(t.x, 0, t.z);
+      chair.rotation.y = t.ry;
+      const seat = new THREE.Mesh(new THREE.BoxGeometry(0.8, 0.1, 0.8), chairMat);
+      seat.position.y = 0.45;
+      const back = new THREE.Mesh(new THREE.BoxGeometry(0.8, 0.8, 0.1), chairMat);
+      back.position.set(0, 0.85, -0.4);
+      const post = new THREE.Mesh(new THREE.CylinderGeometry(0.06, 0.06, 0.45, 8), chairMat);
+      post.position.y = 0.22;
+      [seat, back].forEach((m) => {
+        m.castShadow = true;
+        m.userData.seatIndex = i;
+        clickables.push(m);
+      });
+      chair.add(seat, back, post);
+      scene.add(chair);
+
+      const ringMat = new THREE.MeshBasicMaterial({
+        color: "#a5f3fc",
+        transparent: true,
+        opacity: 0.6,
+        side: THREE.DoubleSide,
+      });
+      const ring = new THREE.Mesh(new THREE.RingGeometry(0.5, 0.62, 32), ringMat);
+      ring.rotation.x = -Math.PI / 2;
+      ring.position.set(t.x, 0.02, t.z);
+      scene.add(ring);
+
+      const lr = TABLE_RADIUS - 0.45;
+      const laptop = new THREE.Group();
+      laptop.position.set(Math.sin(a) * lr, 0.85, Math.cos(a) * lr);
+      laptop.rotation.y = t.ry;
+      const base = new THREE.Mesh(new THREE.BoxGeometry(0.6, 0.03, 0.4), laptopMat);
+      const screenMat = new THREE.MeshStandardMaterial({
+        color: "#111827",
+        emissive: new THREE.Color("#60a5fa"),
+        emissiveIntensity: 0,
+      });
+      const screen = new THREE.Mesh(new THREE.BoxGeometry(0.6, 0.4, 0.03), screenMat);
+      screen.position.set(0, 0.2, 0.2);
+      screen.rotation.x = 0.2;
+      const mug = new THREE.Mesh(new THREE.CylinderGeometry(0.07, 0.06, 0.14, 12), mugMat);
+      mug.position.set(0.45, 0.07, 0);
+      base.castShadow = true;
+      laptop.add(base, screen, mug);
+      scene.add(laptop);
+
+      // 셰이더 재컴파일 방지: 라이트는 항상 씬에 두고 intensity만 조절
+      const light = new THREE.PointLight("#93c5fd", 0, 2.5);
+      light.position.set(Math.sin(a) * (lr + 0.3), 1.2, Math.cos(a) * (lr + 0.3));
+      scene.add(light);
+
+      stations.push({ ring, ringMat, light, screenMat });
+    }
+
+    // 아바타
+    const rigs = new Map<string, AvatarRig>();
+    const localRig = createRig(myProfileRef.current.color, labelLayer);
+    scene.add(localRig.group);
+    rigs.set(SELF_KEY, localRig);
 
     const removeRig = (id: string) => {
-      const rig = avatarRigs.get(id);
+      const rig = rigs.get(id);
       if (!rig) return;
-      scene.remove(rig.root);
-      disposeObject(rig.root);
-      avatarRigs.delete(id);
+      scene.remove(rig.group);
+      disposeObject(rig.group);
+      rig.label.remove();
+      rigs.delete(id);
     };
 
-    // 의자 클릭 착석
-    const raycaster = new THREE.Raycaster();
-    const pointer = new THREE.Vector2();
-    let downPos = { x: 0, y: 0 };
-
-    const updatePointer = (ev: PointerEvent) => {
-      const rect = renderer.domElement.getBoundingClientRect();
-      pointer.x = ((ev.clientX - rect.left) / rect.width) * 2 - 1;
-      pointer.y = -((ev.clientY - rect.top) / rect.height) * 2 + 1;
-    };
-
-    const onPointerMove = (ev: PointerEvent) => {
-      updatePointer(ev);
-      raycaster.setFromCamera(pointer, camera);
-      const hits = raycaster.intersectObjects(clickableChairs, false);
-      if (hits.length > 0) {
-        const idx = hits[0].object.userData.seatIndex as number;
-        const taken =
-          myPhysicsRef.current.seatIndex === idx ||
-          Object.values(peersRef.current).some((p) => p.seatIndex === idx);
-        renderer.domElement.style.cursor = taken ? "grab" : "pointer";
+    const applyPose = (rig: AvatarRig, moving: boolean, seated: boolean, bounce: number, dt: number) => {
+      rig.group.position.set(rig.cur.x, rig.cur.y + bounce, rig.cur.z);
+      rig.group.rotation.y = rig.cur.ry;
+      if (seated) {
+        rig.legL.rotation.x = -Math.PI / 2;
+        rig.legR.rotation.x = -Math.PI / 2;
+      } else if (moving && rig.cur.y < 0.01) {
+        rig.walkPhase += dt * 10;
+        const s = Math.sin(rig.walkPhase) * 0.6;
+        rig.legL.rotation.x = s;
+        rig.legR.rotation.x = -s;
       } else {
-        renderer.domElement.style.cursor = "grab";
+        rig.legL.rotation.x *= 0.8;
+        rig.legR.rotation.x *= 0.8;
       }
     };
 
-    const onPointerDown = (ev: PointerEvent) => {
-      downPos = { x: ev.clientX, y: ev.clientY };
-    };
-
-    const onPointerUp = (ev: PointerEvent) => {
-      if (ev.button !== 0) return;
-      if (Math.hypot(ev.clientX - downPos.x, ev.clientY - downPos.y) > 6) return;
-      updatePointer(ev);
-      raycaster.setFromCamera(pointer, camera);
-      const hits = raycaster.intersectObjects(clickableChairs, false);
-      if (hits.length > 0) {
-        const idx = hits[0].object.userData.seatIndex as number;
-        if (myPhysicsRef.current.seatIndex !== idx) {
-          myPhysicsRef.current.seatIndex = -1;
-          sitOnSeat(idx);
+    // 입력
+    const interact = () => {
+      if (seatRef.current !== null) {
+        standUp();
+        return;
+      }
+      const me = localRef.current;
+      const taken = new Set(Object.values(peersRef.current).map((p) => p.seatIndex));
+      let best = -1;
+      let bestDist = SIT_DISTANCE;
+      for (let i = 0; i < SEAT_COUNT; i++) {
+        if (taken.has(i)) continue;
+        const t = getSeatTransform(i);
+        const d = Math.hypot(t.x - me.x, t.z - me.z);
+        if (d <= bestDist) {
+          best = i;
+          bestDist = d;
         }
       }
+      if (best >= 0) trySit(best);
     };
 
-    renderer.domElement.addEventListener("pointermove", onPointerMove);
+    const MOVE_KEYS = ["KeyW", "KeyA", "KeyS", "KeyD", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"];
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (isTypingTarget(e.target)) return;
+      if (e.code === "Space") {
+        e.preventDefault();
+        if (!e.repeat) jumpQueuedRef.current = true;
+        return;
+      }
+      if (e.code === "KeyE") {
+        if (!e.repeat) interact();
+        return;
+      }
+      if (MOVE_KEYS.includes(e.code)) {
+        e.preventDefault();
+        keysRef.current.add(e.code);
+      }
+    };
+    const onKeyUp = (e: KeyboardEvent) => keysRef.current.delete(e.code);
+    const onBlur = () => keysRef.current.clear();
+    window.addEventListener("keydown", onKeyDown);
+    window.addEventListener("keyup", onKeyUp);
+    window.addEventListener("blur", onBlur);
+
+    // 의자 클릭 (드래그 6px 이하일 때만)
+    const raycaster = new THREE.Raycaster();
+    const ndc = new THREE.Vector2();
+    let down: { x: number; y: number } | null = null;
+    const onPointerDown = (e: PointerEvent) => {
+      down = { x: e.clientX, y: e.clientY };
+    };
+    const onPointerUp = (e: PointerEvent) => {
+      if (!down) return;
+      const moved = Math.hypot(e.clientX - down.x, e.clientY - down.y);
+      down = null;
+      if (moved > 6) return;
+      const rect = renderer.domElement.getBoundingClientRect();
+      ndc.set(((e.clientX - rect.left) / rect.width) * 2 - 1, -((e.clientY - rect.top) / rect.height) * 2 + 1);
+      raycaster.setFromCamera(ndc, camera);
+      const hit = raycaster.intersectObjects(clickables, false)[0];
+      if (!hit) return;
+      const idx = hit.object.userData.seatIndex as number;
+      if (seatRef.current !== idx) trySit(idx);
+    };
     renderer.domElement.addEventListener("pointerdown", onPointerDown);
     renderer.domElement.addEventListener("pointerup", onPointerUp);
 
-    const resizeObserver = new ResizeObserver(() => {
-      viewW = container.clientWidth || 1;
-      viewH = container.clientHeight || 1;
-      camera.aspect = viewW / viewH;
+    // 리사이즈
+    const ro = new ResizeObserver(() => {
+      width = Math.max(1, mount.clientWidth);
+      height = Math.max(1, mount.clientHeight);
+      camera.aspect = width / height;
       camera.updateProjectionMatrix();
-      renderer.setSize(viewW, viewH);
+      renderer.setSize(width, height);
     });
-    resizeObserver.observe(container);
+    ro.observe(mount);
 
-    const timer = new THREE.Timer();
-    timer.connect(document); // 탭 숨김 후 복귀 시 dt 튐 방지
-    const camForward = new THREE.Vector3();
-    const camRight = new THREE.Vector3();
-    const projVec = new THREE.Vector3();
-    const tmpTarget = new THREE.Vector3();
-    let frameId = 0;
-    let frameCounter = 0;
-    let lastNetworkSend = 0;
-    let lastMovingSent = false;
+    // 렌더 루프
+    const fwd = new THREE.Vector3();
+    const followDelta = new THREE.Vector3();
+    const proj = new THREE.Vector3();
+    let raf = 0;
+    let last = performance.now();
+    let lastSend = 0;
+    let lastHeartbeat = 0;
+    let lastSentKey = "";
 
-    const animate = (timestamp?: number) => {
-      frameId = window.requestAnimationFrame(animate);
-      timer.update(timestamp);
-      const dt = Math.min(timer.getDelta(), 0.05);
-      const elapsed = timer.getElapsed();
-      const seatLerp = 1 - Math.exp(-14 * dt);
-      const remoteLerp = 1 - Math.exp(-12 * dt);
+    const placeLabel = (rig: AvatarRig) => {
+      proj.set(rig.group.position.x, rig.group.position.y + 2.05, rig.group.position.z).project(camera);
+      if (proj.z > 1) {
+        rig.label.style.display = "none";
+        return;
+      }
+      rig.label.style.display = "";
+      const sx = (proj.x * 0.5 + 0.5) * width;
+      const sy = (-proj.y * 0.5 + 0.5) * height;
+      rig.label.style.transform = `translate(${sx}px, ${sy}px) translate(-50%, -100%)`;
+    };
+
+    const animate = (now: number) => {
+      raf = requestAnimationFrame(animate);
+      const dt = Math.min((now - last) / 1000, 0.05);
+      last = now;
+      const wall = Date.now();
+      const me = localRef.current;
+      const smooth = 1 - Math.exp(-12 * dt);
+
+      // ─ 로컬 이동 ─
+      const k = keysRef.current;
+      let ix = 0;
+      let iz = 0;
+      if (k.has("KeyW") || k.has("ArrowUp")) iz += 1;
+      if (k.has("KeyS") || k.has("ArrowDown")) iz -= 1;
+      if (k.has("KeyD") || k.has("ArrowRight")) ix += 1;
+      if (k.has("KeyA") || k.has("ArrowLeft")) ix -= 1;
+      const moving = ix !== 0 || iz !== 0;
+
+      if (moving && seatRef.current !== null) standUp();
+
+      if (moving) {
+        camera.getWorldDirection(fwd);
+        fwd.y = 0;
+        fwd.normalize();
+        const rx = -fwd.z;
+        const rz = fwd.x;
+        let dx = fwd.x * iz + rx * ix;
+        let dz = fwd.z * iz + rz * ix;
+        const len = Math.hypot(dx, dz) || 1;
+        dx /= len;
+        dz /= len;
+        let nx = me.x + dx * WALK_SPEED * dt;
+        let nz = me.z + dz * WALK_SPEED * dt;
+        const r = Math.hypot(nx, nz);
+        if (r < TABLE_COLLISION_RADIUS) {
+          if (r < 0.001) {
+            nz = TABLE_COLLISION_RADIUS;
+          } else {
+            nx *= TABLE_COLLISION_RADIUS / r;
+            nz *= TABLE_COLLISION_RADIUS / r;
+          }
+        }
+        me.x = clamp(nx, -ROOM_BOUNDARY, ROOM_BOUNDARY);
+        me.z = clamp(nz, -ROOM_BOUNDARY, ROOM_BOUNDARY);
+        me.ry = wrapAngle(lerpAngle(me.ry, Math.atan2(dx, dz), 1 - Math.exp(-14 * dt)));
+      }
+
+      if (jumpQueuedRef.current) {
+        jumpQueuedRef.current = false;
+        if (me.y <= 0.0001 && seatRef.current === null) me.vy = JUMP_VEL;
+      }
+      if (me.y > 0 || me.vy > 0) {
+        me.vy -= GRAVITY * dt;
+        me.y = Math.max(0, me.y + me.vy * dt);
+        if (me.y === 0) me.vy = 0;
+      }
+      me.moving = moving;
+
+      // ─ 로컬 아바타 ─
+      const myProfile: PeerState = {
+        ...myProfileRef.current,
+        status: statusRef.current,
+        seatIndex: seatRef.current,
+      };
+      const myGesture = gestureRef.current[SELF_KEY];
+      const myGestureOn = !!myGesture && myGesture.until > wall;
+      localRig.cur = { x: me.x, y: me.y, z: me.z, ry: me.ry };
+      applyPose(
+        localRig,
+        moving,
+        seatRef.current !== null,
+        myGestureOn ? Math.abs(Math.sin(now * 0.012)) * 0.25 : 0,
+        dt
+      );
+      updateLabel(localRig, myProfile, myGestureOn ? myGesture.emoji : "", true);
+      placeLabel(localRig);
+
+      // ─ 원격 아바타 생성/삭제 ─
+      const peerMap = peersRef.current;
+      for (const id of Object.keys(peerMap)) {
+        if (!rigs.has(id)) {
+          const rig = createRig(peerMap[id].color, labelLayer);
+          scene.add(rig.group);
+          rigs.set(id, rig);
+        }
+      }
+      for (const id of Array.from(rigs.keys())) {
+        if (id !== SELF_KEY && !peerMap[id]) removeRig(id);
+      }
+
+      // ─ 원격 아바타 보간 ─
+      for (const [id, rig] of rigs) {
+        if (id === SELF_KEY) continue;
+        const p = peerMap[id];
+        const pm = remoteMovesRef.current[id];
+        let tx: number, ty: number, tz: number, tr: number;
+        let mv = false;
+        const seated = p.seatIndex !== null;
+        if (seated) {
+          const t = getSeatTransform(p.seatIndex as number);
+          tx = t.x;
+          ty = 0;
+          tz = t.z;
+          tr = t.ry;
+        } else if (pm) {
+          tx = pm.x;
+          ty = pm.y;
+          tz = pm.z;
+          tr = pm.ry;
+          mv = pm.moving;
+        } else {
+          rig.group.visible = false;
+          rig.label.style.display = "none";
+          continue;
+        }
+        rig.group.visible = true;
+        if (!rig.initialized) {
+          rig.cur = { x: tx, y: ty, z: tz, ry: tr };
+          rig.initialized = true;
+        } else {
+          rig.cur.x += (tx - rig.cur.x) * smooth;
+          rig.cur.y += (ty - rig.cur.y) * smooth;
+          rig.cur.z += (tz - rig.cur.z) * smooth;
+          rig.cur.ry = lerpAngle(rig.cur.ry, tr, smooth);
+        }
+        const g = gestureRef.current[id];
+        const gOn = !!g && g.until > wall;
+        applyPose(rig, mv, seated, gOn ? Math.abs(Math.sin(now * 0.012)) * 0.25 : 0, dt);
+        updateLabel(rig, p, gOn ? g.emoji : "", false);
+        placeLabel(rig);
+      }
+
+      // ─ 좌석/노트북 표시 ─
+      const occupant: (PeerState | null)[] = Array(SEAT_COUNT).fill(null);
+      for (const p of Object.values(peerMap)) if (p.seatIndex !== null) occupant[p.seatIndex] = p;
+      if (seatRef.current !== null) occupant[seatRef.current] = myProfile;
+      const pulse = 0.35 + 0.25 * Math.sin(now * 0.004);
+      stations.forEach((s, i) => {
+        const o = occupant[i];
+        s.ring.visible = !o;
+        s.ringMat.opacity = pulse;
+        const target = o && o.status === "coding" ? 1.6 : 0;
+        s.light.intensity += (target - s.light.intensity) * smooth;
+        s.screenMat.emissiveIntensity = s.light.intensity * 0.6;
+      });
+
+      // ─ 카메라 따라가기 ─
+      followDelta
+        .set(me.x, 1 + me.y * 0.5, me.z)
+        .sub(controls.target)
+        .multiplyScalar(1 - Math.exp(-10 * dt));
+      camera.position.add(followDelta);
+      controls.target.add(followDelta);
       controls.update();
 
-      crystalMesh.rotation.y = elapsed * 0.8;
-      crystalMesh.position.y = 1.52 + Math.sin(elapsed * 2.2) * 0.05;
-
-      // 1) 내 이동
-      const phys = myPhysicsRef.current;
-      const keys = keysPressedRef.current;
-      let moveForward = 0;
-      let moveSide = 0;
-      if (keys.KeyW || keys.ArrowUp) moveForward += 1;
-      if (keys.KeyS || keys.ArrowDown) moveForward -= 1;
-      if (keys.KeyD || keys.ArrowRight) moveSide += 1;
-      if (keys.KeyA || keys.ArrowLeft) moveSide -= 1;
-
-      let jumpedNow = false;
-
-      if (phys.seatIndex === -1 && (moveForward !== 0 || moveSide !== 0)) {
-        camera.getWorldDirection(camForward);
-        camForward.y = 0;
-        camForward.normalize();
-        camRight.set(-camForward.z, 0, camForward.x);
-
-        const dirX = camForward.x * moveForward + camRight.x * moveSide;
-        const dirZ = camForward.z * moveForward + camRight.z * moveSide;
-        const len = Math.hypot(dirX, dirZ) || 1;
-        const normX = dirX / len;
-        const normZ = dirZ / len;
-
-        const speed = 3.9;
-        let nextX = phys.x + normX * speed * dt;
-        let nextZ = phys.z + normZ * speed * dt;
-
-        const distFromCenter = Math.hypot(nextX, nextZ);
-        if (distFromCenter < TABLE_COLLISION_RADIUS) {
-          const s = TABLE_COLLISION_RADIUS / (distFromCenter || 0.001);
-          nextX *= s;
-          nextZ *= s;
-        }
-        const distOuter = Math.hypot(nextX, nextZ);
-        if (distOuter > ROOM_BOUNDARY) {
-          const s = ROOM_BOUNDARY / distOuter;
-          nextX *= s;
-          nextZ *= s;
-        }
-
-        phys.x = nextX;
-        phys.z = nextZ;
-        phys.rotY = Math.atan2(normX, normZ);
-        phys.isMoving = true;
-      } else {
-        phys.isMoving = false;
-      }
-
-      if (phys.triggerJump) {
-        phys.triggerJump = false;
-        const myRig = avatarRigs.get(myId);
-        if (myRig && myRig.jumpY <= 0.01) {
-          myRig.jumpVel = 5.2;
-          jumpedNow = true;
+      // ─ 이동 전송 (~15Hz, 변화 없으면 1초 하트비트) ─
+      if (now - lastSend > MOVE_SEND_INTERVAL) {
+        lastSend = now;
+        const pkt: MovePacket = {
+          x: round2(me.x),
+          y: round2(me.y),
+          z: round2(me.z),
+          ry: round2(wrapAngle(me.ry)),
+          moving,
+        };
+        const key = `${pkt.x},${pkt.y},${pkt.z},${pkt.ry},${moving}`;
+        if (key !== lastSentKey || now - lastHeartbeat > 1000) {
+          sendRef.current?.({ t: "move", ...pkt });
+          lastSentKey = key;
+          lastHeartbeat = now;
         }
       }
-
-      // 원격 점프 큐 소비
-      if (pendingJumpsRef.current.size > 0) {
-        pendingJumpsRef.current.forEach((id) => {
-          const rig = avatarRigs.get(id);
-          if (rig && rig.jumpY <= 0.01) rig.jumpVel = 5.2;
-        });
-        pendingJumpsRef.current.clear();
-      }
-
-      // 근처 빈 의자 감지
-      if (frameCounter % 6 === 0) {
-        if (phys.seatIndex !== -1) {
-          setNearSeat(null);
-        } else {
-          const occupied = new Set(Object.values(peersRef.current).map((p) => p.seatIndex));
-          let found: number | null = null;
-          let minD = 1.65;
-          for (let i = 0; i < 6; i++) {
-            if (occupied.has(i)) continue;
-            const st = chairStations[i];
-            const d = Math.hypot(phys.x - st.seatWorldX, phys.z - st.seatWorldZ);
-            if (d < minD) {
-              minD = d;
-              found = i;
-            }
-          }
-          setNearSeat(found);
-        }
-      }
-
-      // 이동 패킷 전송 (~15Hz)
-      const nowMs = performance.now();
-      const sendMove = sendMoveRef.current;
-      if (
-        sendMove &&
-        (jumpedNow ||
-          (phys.isMoving && nowMs - lastNetworkSend > 66) ||
-          (!phys.isMoving && lastMovingSent))
-      ) {
-        lastNetworkSend = nowMs;
-        lastMovingSent = phys.isMoving;
-        sendMove({
-          seatIndex: phys.seatIndex,
-          x: Number(phys.x.toFixed(3)),
-          z: Number(phys.z.toFixed(3)),
-          rotY: Number(phys.rotY.toFixed(3)),
-          isMoving: phys.isMoving,
-          jump: jumpedNow,
-        });
-      }
-
-      // 2) 전체 플레이어 목록
-      const allPlayers: PeerState[] = [];
-      if (myStateSnapshotRef.current) {
-        allPlayers.push({
-          ...myStateSnapshotRef.current,
-          seatIndex: phys.seatIndex,
-          x: phys.x,
-          z: phys.z,
-          rotY: phys.rotY,
-          isMoving: phys.isMoving,
-        });
-      }
-      Object.values(peersRef.current).forEach((p) => {
-        if (p.peerId && p.peerId !== myId) allPlayers.push(p);
-      });
-
-      const activeIds = new Set(allPlayers.map((p) => p.peerId));
-      Array.from(avatarRigs.keys()).forEach((id) => {
-        if (!activeIds.has(id)) removeRig(id);
-      });
-
-      // 3) 좌석 스테이션 상태
-      chairStations.forEach((st, idx) => {
-        const sitter = allPlayers.find((p) => p.seatIndex === idx);
-        if (sitter) {
-          st.emptyRing.visible = false;
-          if (sitter.status === "coding") {
-            st.laptopGroup.visible = true;
-            st.mugGroup.visible = false;
-            st.screenLight.intensity = 0.85 + Math.sin(elapsed * 7 + idx) * 0.15;
-          } else {
-            st.laptopGroup.visible = false;
-            st.mugGroup.visible = true;
-            st.screenLight.intensity = 0;
-          }
-        } else {
-          st.laptopGroup.visible = false;
-          st.mugGroup.visible = false;
-          st.screenLight.intensity = 0;
-          st.emptyRing.visible = true;
-          (st.emptyRing.material as THREE.MeshBasicMaterial).opacity =
-            0.22 + (Math.sin(elapsed * 3 + idx) + 1) * 0.16;
-        }
-      });
-
-      // 4) 캐릭터 애니메이션
-      const activeGestures = gesturesRef.current;
-
-      allPlayers.forEach((player, idx) => {
-        let rig = avatarRigs.get(player.peerId);
-        if (!rig) {
-          rig = createAvatarRig(player.color || "#6366f1");
-          rig.root.position.set(player.x, 0, player.z);
-          rig.root.rotation.y = player.rotY;
-          avatarRigs.set(player.peerId, rig);
-        }
-
-        const color = player.color || "#6366f1";
-        if (rig.color !== color) {
-          (rig.bodyMesh.material as THREE.MeshStandardMaterial).color.set(color);
-          rig.color = color;
-        }
-
-        if (rig.jumpY > 0 || rig.jumpVel !== 0) {
-          rig.jumpY += rig.jumpVel * dt;
-          rig.jumpVel -= 15.5 * dt;
-          if (rig.jumpY <= 0) {
-            rig.jumpY = 0;
-            rig.jumpVel = 0;
-          }
-        }
-
-        const hasGesture = activeGestures.some((g) => g.peerId === player.peerId);
-        const gestureBounce = hasGesture ? Math.abs(Math.sin(elapsed * 10)) * 0.22 : 0;
-
-        if (player.seatIndex >= 0 && player.seatIndex < 6) {
-          const st = chairStations[player.seatIndex];
-          tmpTarget.set(st.seatWorldX, 0, st.seatWorldZ);
-          rig.root.position.lerp(tmpTarget, seatLerp);
-          rig.root.rotation.y = st.lookTableRotY;
-          rig.bodyGroup.position.y = 0.26 + gestureBounce;
-
-          rig.leftLeg.rotation.x = -Math.PI / 2.4;
-          rig.rightLeg.rotation.x = -Math.PI / 2.4;
-          rig.leftLeg.position.set(0.13, 0.34, 0.2);
-          rig.rightLeg.position.set(-0.13, 0.34, 0.2);
-
-          if (player.status === "coding") {
-            rig.leftHand.position.set(0.16, 0.94 + Math.abs(Math.sin(elapsed * 15 + idx)) * 0.055, 1.12);
-            rig.rightHand.position.set(-0.16, 0.94 + Math.abs(Math.cos(elapsed * 15 + idx)) * 0.055, 1.12);
-            rig.headGroup.rotation.x = 0.14 + Math.sin(elapsed * 2.5 + idx) * 0.03;
-          } else {
-            rig.leftHand.position.set(0.24, 0.85, 0.45);
-            rig.rightHand.position.set(-0.24, 0.85, 0.45);
-            rig.headGroup.rotation.x = -0.04;
-          }
-        } else {
-          if (player.peerId === myId) {
-            rig.root.position.set(player.x, 0, player.z);
-            rig.root.rotation.y = player.rotY;
-          } else {
-            tmpTarget.set(player.x, 0, player.z);
-            rig.root.position.lerp(tmpTarget, remoteLerp);
-            const diff = Math.atan2(
-              Math.sin(player.rotY - rig.root.rotation.y),
-              Math.cos(player.rotY - rig.root.rotation.y)
-            );
-            rig.root.rotation.y += diff * remoteLerp;
-          }
-
-          rig.leftLeg.position.set(0.13, 0.23, 0);
-          rig.rightLeg.position.set(-0.13, 0.23, 0);
-          rig.headGroup.rotation.x = 0;
-
-          if (player.isMoving) {
-            const walkCycle = elapsed * 12;
-            const bob = Math.abs(Math.sin(walkCycle)) * 0.07;
-            rig.bodyGroup.position.y = rig.jumpY + gestureBounce + bob;
-            rig.leftLeg.rotation.x = Math.sin(walkCycle) * 0.65;
-            rig.rightLeg.rotation.x = -Math.sin(walkCycle) * 0.65;
-            rig.leftHand.position.set(0.35, 0.72, -Math.sin(walkCycle) * 0.22);
-            rig.rightHand.position.set(-0.35, 0.72, Math.sin(walkCycle) * 0.22);
-          } else {
-            rig.bodyGroup.position.y = rig.jumpY + gestureBounce + Math.sin(elapsed * 2.5) * 0.02;
-            rig.leftLeg.rotation.x = 0;
-            rig.rightLeg.rotation.x = 0;
-            rig.leftHand.position.set(0.35, 0.72, 0.06);
-            rig.rightHand.position.set(-0.35, 0.72, 0.06);
-          }
-        }
-      });
 
       renderer.render(scene, camera);
-
-      // 이름표: React state 대신 DOM transform 직접 갱신
-      labelElsRef.current.forEach((el, id) => {
-        const rig = avatarRigs.get(id);
-        if (!rig) {
-          el.style.visibility = "hidden";
-          return;
-        }
-        rig.labelAnchor.getWorldPosition(projVec);
-        projVec.project(camera);
-        if (projVec.z > 1 || projVec.z < -1) {
-          el.style.visibility = "hidden";
-          return;
-        }
-        const sx = (projVec.x * 0.5 + 0.5) * viewW;
-        const sy = (-projVec.y * 0.5 + 0.5) * viewH;
-        el.style.visibility = "visible";
-        el.style.transform = `translate3d(${sx}px, ${sy}px, 0) translate(-50%, -100%)`;
-      });
-
-      frameCounter += 1;
     };
-
-    animate();
+    raf = requestAnimationFrame(animate);
 
     return () => {
-      window.cancelAnimationFrame(frameId);
-      timer.dispose();
-      resizeObserver.disconnect();
-      renderer.domElement.removeEventListener("pointermove", onPointerMove);
+      cancelAnimationFrame(raf);
+      ro.disconnect();
+      window.removeEventListener("keydown", onKeyDown);
+      window.removeEventListener("keyup", onKeyUp);
+      window.removeEventListener("blur", onBlur);
       renderer.domElement.removeEventListener("pointerdown", onPointerDown);
       renderer.domElement.removeEventListener("pointerup", onPointerUp);
-      cameraResetRef.current = null;
       controls.dispose();
+      for (const id of Array.from(rigs.keys())) removeRig(id);
       disposeObject(scene);
-      avatarRigs.clear();
       renderer.dispose();
-      if (container.contains(renderer.domElement)) {
-        container.removeChild(renderer.domElement);
-      }
+      renderer.domElement.remove();
+      labelLayer.innerHTML = "";
     };
-  }, [joined, myId, sitOnSeat]);
+  }, [phase, standUp, trySit]);
 
-  useEffect(() => {
-    chatBottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages]);
-
-  const handleEnterRoom = (e: React.FormEvent<HTMLFormElement>) => {
-    e.preventDefault();
-    if (!nickname.trim() || !roomId.trim() || !myId) return;
-    setJoinedAt(Date.now());
-    myPhysicsRef.current = {
-      x: (Math.random() - 0.5) * 2.2,
-      z: 5.1,
-      rotY: Math.PI,
-      seatIndex: -1,
-      isMoving: false,
-      triggerJump: false,
+  /* ── 핸들러 ── */
+  const handleEnter = () => {
+    const roomName = roomInput.trim().slice(0, 40) || "모각코";
+    myProfileRef.current = {
+      id: "",
+      name: nameInput.trim().slice(0, 12) || "익명",
+      goal: goalInput.trim().slice(0, 28),
+      avatar,
+      color,
+      status: "coding",
+      seatIndex: null,
+      joinedAt: 0,
     };
-    setMySeat(-1);
+    statusRef.current = "coding";
+    setStatus("coding");
+    seatRef.current = null;
+    setSeatIndex(null);
+    localRef.current = { x: 0, y: 0, z: 6.2, ry: Math.PI, vy: 0, moving: false };
     commitPeers({});
-    setMessages([]);
-    setJoined(true);
-    playChime();
+    remoteMovesRef.current = {};
+    gestureRef.current = {};
+    setActiveRoom(roomName);
+    setMessages([
+      {
+        id: makeId(),
+        kind: "system",
+        text: `'${roomName}' 방에 입장했습니다. 의자를 클릭하거나 가까이 가서 E를 눌러 앉아보세요.`,
+      },
+    ]);
+    setPhase("room");
   };
 
-  const handleSendGesture = (emoji: string, label: string) => {
-    if (!myId) return;
-    const payload: GesturePayload = { id: `${Date.now()}_${Math.random()}`, peerId: myId, emoji, label };
-    triggerFloatingGesture(payload);
-    sendGestureRef.current?.(payload);
+  const handleSendChat = () => {
+    const text = chatInput.trim().slice(0, MAX_CHAT_LEN);
+    if (!text) return;
+    if (!sendRef.current) {
+      addSystemMessage("서버와 연결되어 있지 않아 메시지를 보내지 못했어요.");
+      return;
+    }
+    sendRef.current({ t: "chat", text });
+    const me = myProfileRef.current;
+    pushMessage({ kind: "chat", text, name: me.name, avatar: me.avatar, color: me.color, mine: true });
+    setChatInput("");
   };
 
-  const handleSendMessage = (e: React.FormEvent<HTMLFormElement>) => {
-    e.preventDefault();
-    const text = inputText.trim().slice(0, 500);
-    if (!text || !myId) return;
-    const msg: ChatPayload = {
-      id: `${Date.now()}_${myId}_${Math.random().toString(36).slice(2, 6)}`,
-      senderId: myId,
-      nickname,
-      avatar: selectedAvatar,
-      text,
-      timestamp: nowTime(),
-    };
-    setMessages((prev) => [...prev.slice(-99), msg]);
-    sendChatRef.current?.(msg);
-    setInputText("");
+  const handleGesture = (emoji: string) => {
+    gestureRef.current[SELF_KEY] = { emoji, until: Date.now() + GESTURE_MS };
+    sendRef.current?.({ t: "gesture", emoji });
   };
 
-  const peerCount = Object.keys(peers).length;
+  const toggleStatus = () => {
+    const next: Status = statusRef.current === "coding" ? "resting" : "coding";
+    statusRef.current = next;
+    setStatus(next);
+  };
 
-  const visiblePlayers: PeerState[] = [];
-  if (joined && myId) {
-    visiblePlayers.push({
-      peerId: myId,
-      nickname,
-      avatar: selectedAvatar,
-      color: selectedColor,
-      seatIndex: mySeat,
-      x: 0,
-      z: 0,
-      rotY: 0,
-      isMoving: false,
-      status: myStatus,
-      task,
-      joinedAt,
-    });
-    Object.values(peers).forEach((p) => {
-      if (p.peerId && p.peerId !== myId) visiblePlayers.push(p);
-    });
-  }
+  const toggleSound = () => {
+    const next = !soundOnRef.current;
+    soundOnRef.current = next;
+    setSoundOn(next);
+  };
 
-  // ==========================================================================
-  // 1) 로비
-  // ==========================================================================
-  if (!joined) {
+  const peerList = Object.values(peers);
+  const peerCount = peerList.length;
+
+  /* =========================================================
+   * 렌더: 로비
+   * ======================================================= */
+  if (phase === "lobby") {
     return (
-      <main className="min-h-screen bg-slate-950 text-slate-100 flex items-center justify-center p-4 selection:bg-indigo-600">
-        <div className="max-w-md w-full bg-slate-900/90 border border-slate-800 rounded-3xl p-8 shadow-2xl backdrop-blur">
-          <div className="text-center mb-7">
-            <div className="inline-flex items-center justify-center w-16 h-16 rounded-2xl bg-indigo-950/80 border border-indigo-500/30 mb-4 text-indigo-400">
-              <Terminal className="w-8 h-8" />
-            </div>
-            <h1 className="text-2xl font-bold tracking-tight text-white">3D 온라인 모각코룸</h1>
-            <p className="text-xs text-slate-400 mt-2 leading-relaxed">
-              캐릭터를 직접 움직여 원형 테이블에 둘러앉아 코딩하는 P2P 가상 공간입니다.
-              <br />
-              최대 6명이 한 룸에서 함께 개발하고 소통할 수 있습니다!
+      <main className="flex min-h-screen items-center justify-center bg-slate-950 p-4 text-white">
+        <div className="w-full max-w-md rounded-2xl border border-white/10 bg-slate-900/80 p-6 shadow-2xl">
+          <h1 className="text-2xl font-bold">모각코룸 3D</h1>
+          <p className="mt-1 text-sm text-slate-400">같은 사내망에서 호스트 주소로 접속한 동료와 함께해요.</p>
+
+          {/* 호스트 접속 주소 */}
+          <div className="mt-5 rounded-xl border border-indigo-500/30 bg-indigo-500/10 p-3 text-sm">
+            <p className="text-xs text-indigo-300">동료에게 알려줄 접속 주소</p>
+            {hostInfo ? (
+              hostInfo.ips.length > 0 ? (
+                hostInfo.ips.map((ip) => (
+                  <p key={ip} className="mt-1 select-all font-mono text-base font-semibold">
+                    http://{ip}:{hostInfo.port}
+                  </p>
+                ))
+              ) : (
+                <p className="mt-1 text-amber-300">LAN IP를 찾지 못했어요. 네트워크 연결을 확인해 주세요.</p>
+              )
+            ) : hostError ? (
+              <p className="mt-1 text-red-400">{hostError}</p>
+            ) : (
+              <p className="mt-1 text-slate-400">확인 중...</p>
+            )}
+            <p className="mt-2 text-[11px] text-slate-400">
+              같은 Wi-Fi/사내망이어야 하고, 호스트 PC에서 서버가 켜져 있어야 해요.
             </p>
+            {isHttps && (
+              <p className="mt-2 text-[11px] text-red-400">
+                https 배포 페이지에서는 사용할 수 없어요. 위의 http 주소로 접속해 주세요.
+              </p>
+            )}
           </div>
 
-          <form onSubmit={handleEnterRoom} className="space-y-4">
-            <div>
-              <label className="block text-xs font-medium text-slate-400 mb-1.5">모각코룸 코드 (방 이름)</label>
+          <div className="mt-5 space-y-4">
+            <label className="block">
+              <span className="text-xs text-slate-400">방 이름</span>
               <input
-                type="text"
-                value={roomId}
-                onChange={(e) => setRoomId(e.target.value)}
-                className="w-full bg-slate-950 border border-slate-800 rounded-xl px-4 py-2.5 text-sm text-slate-100 focus:outline-none focus:border-indigo-500"
-                placeholder="같은 방 이름을 입력한 사람끼리 만납니다"
-                required
+                className="mt-1 w-full rounded-lg bg-slate-800 px-3 py-2 outline-none ring-indigo-500 focus:ring-2"
+                placeholder="예: frontend-team"
+                maxLength={40}
+                value={roomInput}
+                onChange={(e) => setRoomInput(e.target.value)}
               />
-            </div>
-
-            <div>
-              <label className="block text-xs font-medium text-slate-400 mb-1.5">닉네임</label>
+            </label>
+            <label className="block">
+              <span className="text-xs text-slate-400">닉네임 (12자)</span>
               <input
-                type="text"
+                className="mt-1 w-full rounded-lg bg-slate-800 px-3 py-2 outline-none ring-indigo-500 focus:ring-2"
                 maxLength={12}
-                value={nickname}
-                onChange={(e) => setNickname(e.target.value)}
-                className="w-full bg-slate-950 border border-slate-800 rounded-xl px-4 py-2.5 text-sm text-slate-100 focus:outline-none focus:border-indigo-500"
-                placeholder="사용할 닉네임을 입력하세요"
-                required
+                value={nameInput}
+                onChange={(e) => setNameInput(e.target.value)}
               />
-            </div>
-
-            <div>
-              <label className="block text-xs font-medium text-slate-400 mb-1.5">오늘의 코딩 목표 (한 줄 상태)</label>
+            </label>
+            <label className="block">
+              <span className="text-xs text-slate-400">오늘의 목표 (28자)</span>
               <input
-                type="text"
+                className="mt-1 w-full rounded-lg bg-slate-800 px-3 py-2 outline-none ring-indigo-500 focus:ring-2"
                 maxLength={28}
-                value={task}
-                onChange={(e) => setTask(e.target.value)}
-                className="w-full bg-slate-950 border border-slate-800 rounded-xl px-4 py-2.5 text-sm text-slate-100 focus:outline-none focus:border-indigo-500"
-                placeholder="예: 포트폴리오 UI 다듬기"
+                value={goalInput}
+                onChange={(e) => setGoalInput(e.target.value)}
               />
-            </div>
+            </label>
 
             <div>
-              <label className="block text-xs font-medium text-slate-400 mb-2">아이콘 & 3D 캐릭터 컬러</label>
-              <div className="grid grid-cols-8 gap-1.5 mb-3">
-                {AVATARS.map((av) => (
+              <span className="text-xs text-slate-400">아바타</span>
+              <div className="mt-1 grid grid-cols-8 gap-1">
+                {AVATARS.map((a) => (
                   <button
+                    key={a}
                     type="button"
-                    key={av}
-                    onClick={() => setSelectedAvatar(av)}
-                    className={`h-9 rounded-xl text-lg flex items-center justify-center transition ${
-                      selectedAvatar === av
-                        ? "bg-indigo-600/30 border-2 border-indigo-400 scale-105"
-                        : "bg-slate-950 border border-slate-800 hover:bg-slate-800"
-                    }`}
+                    onClick={() => setAvatar(a)}
+                    className={`rounded-lg py-1 text-2xl ${avatar === a ? "bg-indigo-600" : "bg-slate-800 hover:bg-slate-700"}`}
                   >
-                    {av}
+                    {a}
                   </button>
                 ))}
               </div>
-              <div className="flex items-center justify-between gap-2 bg-slate-950 border border-slate-800 rounded-xl px-3 py-2">
-                <span className="text-xs text-slate-400">후드 색상</span>
-                <div className="flex items-center gap-2">
-                  {CHARACTER_COLORS.map((c) => (
-                    <button
-                      type="button"
-                      key={c.hex}
-                      onClick={() => setSelectedColor(c.hex)}
-                      style={{ backgroundColor: c.hex }}
-                      className={`w-6 h-6 rounded-full transition ${
-                        selectedColor === c.hex
-                          ? "ring-2 ring-white ring-offset-2 ring-offset-slate-950 scale-110"
-                          : "opacity-70 hover:opacity-100"
-                      }`}
-                      title={c.name}
-                    />
-                  ))}
-                </div>
-              </div>
             </div>
 
-            {initError && (
-              <p className="text-xs text-red-300 bg-red-950/40 border border-red-800/50 rounded-xl p-2.5">
-                {initError}
-              </p>
-            )}
+            <div>
+              <span className="text-xs text-slate-400">컬러</span>
+              <div className="mt-1 flex gap-2">
+                {COLORS.map((c) => (
+                  <button
+                    key={c}
+                    type="button"
+                    onClick={() => setColor(c)}
+                    className={`h-8 w-8 rounded-full ${color === c ? "ring-2 ring-white ring-offset-2 ring-offset-slate-900" : ""}`}
+                    style={{ backgroundColor: c }}
+                    aria-label={c}
+                  />
+                ))}
+              </div>
+            </div>
+          </div>
 
-            <button
-              type="submit"
-              disabled={!myId}
-              className="w-full py-3 rounded-xl bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white font-semibold text-sm transition shadow-lg shadow-indigo-950/60"
-            >
-              {myId ? "3D 모각코룸 입장하기 💻" : "준비 중..."}
-            </button>
-          </form>
+          <button
+            type="button"
+            onClick={handleEnter}
+            disabled={!hostInfo && !hostError}
+            className="mt-6 w-full rounded-xl bg-indigo-600 py-3 font-semibold hover:bg-indigo-500 disabled:cursor-not-allowed disabled:bg-slate-700"
+          >
+            {hostInfo || hostError ? "입장하기" : "서버 확인 중..."}
+          </button>
         </div>
       </main>
     );
   }
 
-  // ==========================================================================
-  // 2) 메인 화면
-  // ==========================================================================
+  /* =========================================================
+   * 렌더: 룸
+   * ======================================================= */
   return (
-    <div className="h-screen w-screen bg-slate-950 text-slate-100 flex flex-col lg:flex-row overflow-hidden">
-      <div className="relative flex-1 h-[62vh] lg:h-full overflow-hidden select-none">
-        <div ref={mountRef} className="absolute inset-0 w-full h-full" />
+    <main className="flex h-screen w-full overflow-hidden bg-slate-950 text-white">
+      {/* 3D 영역 */}
+      <section className="relative flex-1">
+        <div ref={mountRef} className="absolute inset-0" />
+        <div ref={labelLayerRef} className="pointer-events-none absolute inset-0 overflow-hidden" />
 
-        {/* 이름표: 위치는 렌더 루프에서 transform으로 직접 갱신 */}
-        <div className="absolute inset-0 pointer-events-none overflow-hidden z-10">
-          {visiblePlayers.map((player) => {
-            const isMe = player.peerId === myId;
-            const playerGestures = gestures.filter((g) => g.peerId === player.peerId);
-            const id = player.peerId;
-
-            return (
-              <div
-                key={id}
-                ref={(el) => {
-                  if (!el) return;
-                  labelElsRef.current.set(id, el);
-                  return () => {
-                    labelElsRef.current.delete(id);
-                  };
-                }}
-                style={{ visibility: "hidden" }}
-                className="absolute left-0 top-0 flex flex-col items-center will-change-transform"
-              >
-                {playerGestures.map((g) => (
-                  <div
-                    key={g.id}
-                    className="mb-1.5 flex items-center gap-1 px-3 py-1 rounded-full bg-indigo-600/95 border border-indigo-300/60 shadow-xl animate-bounce whitespace-nowrap"
-                  >
-                    <span className="text-base">{g.emoji}</span>
-                    <span className="text-xs font-semibold text-white">{g.label}</span>
-                  </div>
-                ))}
-
-                <div
-                  className={`px-2.5 py-1 rounded-xl backdrop-blur-md border shadow-lg flex flex-col items-center max-w-38.75 ${
-                    isMe ? "bg-indigo-950/85 border-indigo-400/70" : "bg-slate-900/85 border-slate-700/70"
-                  }`}
-                >
-                  <div className="flex items-center gap-1 text-xs font-semibold text-white whitespace-nowrap">
-                    <span>{player.avatar}</span>
-                    <span className="truncate max-w-22.5">{player.nickname}</span>
-                    {isMe && <span className="text-[10px] text-indigo-300">(나)</span>}
-                    {player.seatIndex !== -1 ? (
-                      player.status === "coding" ? (
-                        <Code2 className="w-3 h-3 text-emerald-400 shrink-0" />
-                      ) : (
-                        <Coffee className="w-3 h-3 text-amber-400 shrink-0" />
-                      )
-                    ) : (
-                      <Footprints className="w-3 h-3 text-sky-400 shrink-0" />
-                    )}
-                  </div>
-                  <p className="text-[10px] text-slate-300 truncate max-w-35 mt-0.5">
-                    {player.seatIndex === -1 ? "라운지 산책 중" : player.task || "집중 코딩 중"}
-                  </p>
-                </div>
-              </div>
-            );
-          })}
+        {/* HUD 상단 */}
+        <div className="absolute left-3 top-3 flex flex-wrap items-center gap-2">
+          <span className="rounded-full bg-black/60 px-3 py-1 text-sm font-semibold"># {activeRoom}</span>
+          {conn === "open" ? (
+            <span className="flex items-center gap-1 rounded-full bg-emerald-600/80 px-3 py-1 text-xs font-semibold">
+              <Users size={14} /> {peerCount > 0 ? `연결됨 · ${peerCount + 1}명` : "연결됨 · 혼자 있어요"}
+            </span>
+          ) : conn === "connecting" ? (
+            <span className="rounded-full bg-amber-500/80 px-3 py-1 text-xs font-semibold text-black">서버 연결 중...</span>
+          ) : (
+            <span className="rounded-full bg-red-600/80 px-3 py-1 text-xs font-semibold">연결 끊김 · 재연결 중</span>
+          )}
+          <button
+            type="button"
+            onClick={handleReconnect}
+            className="flex items-center gap-1 rounded-full bg-black/60 px-3 py-1 text-xs hover:bg-black/80"
+            title="서버 재연결"
+          >
+            <RefreshCw size={14} /> 재연결
+          </button>
+          <button
+            type="button"
+            onClick={toggleSound}
+            className="rounded-full bg-black/60 p-1.5 hover:bg-black/80"
+            title="알림음"
+          >
+            {soundOn ? <Volume2 size={16} /> : <VolumeX size={16} />}
+          </button>
+          <button
+            type="button"
+            onClick={() => leaveRoom()}
+            className="flex items-center gap-1 rounded-full bg-red-600/80 px-3 py-1 text-xs hover:bg-red-600"
+          >
+            <LogOut size={14} /> 나가기
+          </button>
         </div>
 
-        <header className="absolute top-4 left-4 right-4 z-20 flex items-center justify-between pointer-events-none">
-          <div className="pointer-events-auto bg-slate-900/85 border border-slate-800 backdrop-blur-md rounded-2xl px-4 py-2.5 flex items-center gap-3 shadow-xl">
-            <div className="w-9 h-9 rounded-xl bg-indigo-950 border border-indigo-500/40 flex items-center justify-center text-indigo-400">
-              <Terminal className="w-4 h-4" />
-            </div>
-            <div>
-              <div className="flex items-center gap-2 flex-wrap">
-                <h2 className="text-sm font-semibold text-white">모각코룸: {roomId}</h2>
-                <span className="text-xs px-2 py-0.5 rounded-full bg-slate-800 text-slate-200 flex items-center gap-1">
-                  <Users className="w-3 h-3 text-indigo-400" /> {visiblePlayers.length} / {MAX_PLAYERS}
+        {/* HUD 하단 */}
+        <div className="absolute bottom-3 left-1/2 flex -translate-x-1/2 flex-col items-center gap-2">
+          <div className="flex gap-1 rounded-full bg-black/60 p-1">
+            {GESTURES.map((g) => (
+              <button
+                key={g}
+                type="button"
+                onClick={() => handleGesture(g)}
+                className="rounded-full px-2 py-1 text-xl hover:bg-white/20"
+              >
+                {g}
+              </button>
+            ))}
+            <button
+              type="button"
+              onClick={toggleStatus}
+              className="ml-1 rounded-full bg-white/10 px-3 text-xs font-semibold hover:bg-white/20"
+            >
+              {status === "coding" ? "💻 코딩 중" : "☕ 휴식 중"}
+            </button>
+          </div>
+          <p className="rounded bg-black/50 px-2 py-1 text-[11px] text-slate-300">
+            WASD/방향키 이동 · Space 점프 · E 앉기/일어나기 · 의자 클릭 착석 · 드래그로 시점 회전
+            {seatIndex !== null && ` · ${seatIndex + 1}번 자리`}
+          </p>
+        </div>
+      </section>
+
+      {/* 사이드: 참여자 + 채팅 */}
+      <aside className="flex w-80 flex-col border-l border-white/10 bg-slate-900">
+        <div className="border-b border-white/10 p-3">
+          <p className="mb-2 text-xs text-slate-400">
+            참여자 {peerCount + 1}/{MAX_PLAYERS}
+          </p>
+          <ul className="space-y-1 text-sm">
+            <li className="flex items-center gap-2">
+              <span className="h-2 w-2 rounded-full" style={{ backgroundColor: myProfileRef.current.color }} />
+              {myProfileRef.current.avatar} {myProfileRef.current.name} (나)
+              <span className="ml-auto text-xs">{status === "coding" ? "💻" : "☕"}</span>
+            </li>
+            {peerList.map((p) => (
+              <li key={p.id} className="flex items-center gap-2">
+                <span className="h-2 w-2 rounded-full" style={{ backgroundColor: p.color }} />
+                {p.avatar} {p.name}
+                <span className="ml-auto text-xs">{p.status === "coding" ? "💻" : "☕"}</span>
+              </li>
+            ))}
+          </ul>
+        </div>
+
+        <div ref={chatBoxRef} className="flex-1 space-y-2 overflow-y-auto p-3 text-sm">
+          {messages.map((m) =>
+            m.kind === "system" ? (
+              <p key={m.id} className="text-center text-xs text-slate-400">
+                {m.text}
+              </p>
+            ) : (
+              <div key={m.id} className={`flex flex-col ${m.mine ? "items-end" : "items-start"}`}>
+                <span className="text-[11px]" style={{ color: m.color }}>
+                  {m.avatar} {m.name}
                 </span>
                 <span
-                  className={`text-[11px] px-2 py-0.5 rounded-full border flex items-center gap-1 ${
-                    peerCount > 0
-                      ? "bg-emerald-950/80 border-emerald-700/50 text-emerald-300"
-                      : "bg-amber-950/80 border-amber-700/50 text-amber-300"
+                  className={`max-w-[85%] whitespace-pre-wrap break-words rounded-xl px-3 py-1.5 ${
+                    m.mine ? "bg-indigo-600" : "bg-slate-800"
                   }`}
                 >
-                  <Wifi className="w-3 h-3" />
-                  {isConnecting ? "연결 중..." : peerCount > 0 ? `P2P 연결 ${peerCount}명` : "참여자 대기 중"}
+                  {m.text}
                 </span>
               </div>
-              <p className="text-[11px] text-slate-400 mt-0.5 hidden sm:block">
-                WASD/방향키: 이동 · Space: 점프 · 빈 의자 클릭 또는 [E]: 착석
-              </p>
-            </div>
-          </div>
-
-          <div className="pointer-events-auto flex items-center gap-2">
-            <button
-              type="button"
-              onClick={handleReconnect}
-              className="p-2.5 rounded-xl bg-slate-900/85 border border-slate-800 backdrop-blur-md text-slate-300 hover:text-emerald-300 transition shadow-lg"
-              title="P2P 재연결"
-            >
-              <RefreshCw className="w-4 h-4" />
-            </button>
-            <button
-              type="button"
-              onClick={() => cameraResetRef.current?.()}
-              className="p-2.5 rounded-xl bg-slate-900/85 border border-slate-800 backdrop-blur-md text-slate-300 hover:text-indigo-300 transition shadow-lg"
-              title="카메라 시점 초기화"
-            >
-              <RotateCcw className="w-4 h-4" />
-            </button>
-            <button
-              type="button"
-              onClick={() => setSoundOn((v) => !v)}
-              className="p-2.5 rounded-xl bg-slate-900/85 border border-slate-800 backdrop-blur-md text-slate-300 hover:text-indigo-300 transition shadow-lg"
-              title="알림음 켜기/끄기"
-            >
-              {soundOn ? <Volume2 className="w-4 h-4" /> : <VolumeX className="w-4 h-4" />}
-            </button>
-            <button
-              type="button"
-              onClick={handleLeaveRoom}
-              className="flex items-center gap-1.5 px-3 py-2 rounded-xl bg-slate-900/85 border border-slate-800 backdrop-blur-md text-xs text-slate-300 hover:bg-red-950/60 hover:border-red-800/60 hover:text-red-200 transition shadow-lg"
-            >
-              <LogOut className="w-3.5 h-3.5" /> 나가기
-            </button>
-          </div>
-        </header>
-
-        {nearSeat !== null && mySeat === -1 && (
-          <div className="absolute bottom-20 left-1/2 -translate-x-1/2 z-20 pointer-events-auto">
-            <button
-              type="button"
-              onClick={() => sitOnSeat(nearSeat)}
-              className="px-4 py-2 rounded-full bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold shadow-xl border border-indigo-300/50 flex items-center gap-2 animate-bounce"
-            >
-              <Armchair className="w-4 h-4" />
-              [E] 키 또는 클릭하여 {nearSeat + 1}번 좌석에 앉기
-            </button>
-          </div>
-        )}
-
-        <div className="absolute bottom-4 left-4 right-4 z-20 flex justify-center pointer-events-none">
-          <div className="pointer-events-auto max-w-3xl w-full bg-slate-900/85 border border-slate-800/90 backdrop-blur-md rounded-2xl p-2.5 flex flex-wrap items-center justify-between gap-2 shadow-2xl">
-            <div className="flex items-center gap-1.5 flex-wrap">
-              {GESTURES.map((g) => (
-                <button
-                  type="button"
-                  key={g.label}
-                  onClick={() => handleSendGesture(g.emoji, g.label)}
-                  className="px-2.5 py-1.5 rounded-xl bg-slate-950/90 hover:bg-slate-800 border border-slate-800 text-xs flex items-center gap-1.5 transition active:scale-95"
-                >
-                  <span className="text-base">{g.emoji}</span>
-                  <span className="hidden sm:inline text-slate-300">{g.label}</span>
-                </button>
-              ))}
-            </div>
-
-            <div className="flex items-center gap-2">
-              {mySeat !== -1 ? (
-                <>
-                  <button
-                    type="button"
-                    onClick={() => setMyStatus((s) => (s === "coding" ? "resting" : "coding"))}
-                    className={`px-3 py-1.5 rounded-xl text-xs font-medium flex items-center gap-1.5 transition ${
-                      myStatus === "coding"
-                        ? "bg-emerald-950/90 text-emerald-300 border border-emerald-700/60"
-                        : "bg-amber-950/90 text-amber-300 border border-amber-700/60"
-                    }`}
-                  >
-                    <Sparkles className="w-3.5 h-3.5" />
-                    {myStatus === "coding" ? "집중 코딩 중" : "커피 휴식 중"}
-                  </button>
-                  <button
-                    type="button"
-                    onClick={standUpFromSeat}
-                    className="px-3 py-1.5 rounded-xl text-xs font-medium bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 flex items-center gap-1.5 transition"
-                  >
-                    <Footprints className="w-3.5 h-3.5 text-sky-400" />
-                    일어나기
-                  </button>
-                </>
-              ) : (
-                <button
-                  type="button"
-                  onClick={() => {
-                    const occupied = new Set(Object.values(peersRef.current).map((p) => p.seatIndex));
-                    const empty = [0, 1, 2, 3, 4, 5].find((s) => !occupied.has(s));
-                    if (empty !== undefined) sitOnSeat(empty);
-                  }}
-                  className="px-3.5 py-1.5 rounded-xl text-xs font-medium bg-indigo-600 hover:bg-indigo-500 text-white flex items-center gap-1.5 transition"
-                >
-                  <Armchair className="w-3.5 h-3.5" />빈 자리에 바로 앉기
-                </button>
-              )}
-            </div>
-          </div>
-        </div>
-      </div>
-
-      <aside className="w-full lg:w-96 h-[38vh] lg:h-full bg-slate-900/95 border-t lg:border-t-0 lg:border-l border-slate-800 flex flex-col z-30">
-        <div className="p-4 border-b border-slate-800 hidden lg:block">
-          <h3 className="text-sm font-semibold text-white">라운지 채팅</h3>
-          <p className="text-xs text-slate-400 mt-0.5">대화는 서버에 저장되지 않으며 퇴장 시 사라집니다</p>
+            )
+          )}
         </div>
 
-        <div className="px-4 py-2.5 bg-slate-950/70 border-b border-slate-800 flex items-center gap-2">
-          <span className="text-[11px] text-indigo-400 shrink-0 font-medium">내 목표:</span>
+        <div className="flex gap-2 border-t border-white/10 p-3">
           <input
-            type="text"
-            maxLength={28}
-            value={task}
-            onChange={(e) => setTask(e.target.value)}
-            className="w-full bg-transparent text-xs text-slate-200 focus:outline-none"
-            placeholder="현재 진행 중인 작업 입력..."
+            className="flex-1 rounded-lg bg-slate-800 px-3 py-2 text-sm outline-none ring-indigo-500 focus:ring-2"
+            placeholder="메시지 입력"
+            maxLength={MAX_CHAT_LEN}
+            value={chatInput}
+            onFocus={() => keysRef.current.clear()}
+            onChange={(e) => setChatInput(e.target.value)}
+            onKeyDown={(e) => {
+              // 한글 IME 조합 중 Enter 중복 전송 방지
+              if (e.key === "Enter" && !e.nativeEvent.isComposing) {
+                e.preventDefault();
+                handleSendChat();
+              }
+            }}
           />
-        </div>
-
-        <div className="flex-1 overflow-y-auto p-4 space-y-3">
-          {messages.map((msg) => {
-            if (msg.isSystem) {
-              return (
-                <div
-                  key={msg.id}
-                  className="text-[11px] text-indigo-200/90 bg-indigo-950/40 border border-indigo-800/40 rounded-xl p-2.5 leading-relaxed"
-                >
-                  {msg.text}
-                </div>
-              );
-            }
-            const isMine = msg.senderId === myId;
-            return (
-              <div key={msg.id} className={`flex flex-col ${isMine ? "items-end" : "items-start"}`}>
-                <span className="text-[11px] text-slate-400 mb-1 flex items-center gap-1">
-                  <span>{msg.avatar}</span> {msg.nickname} · {msg.timestamp}
-                </span>
-                <div
-                  className={`max-w-[82%] px-3.5 py-2 rounded-2xl text-xs leading-relaxed break-words ${
-                    isMine ? "bg-indigo-600 text-white rounded-tr-sm" : "bg-slate-800 text-slate-200 rounded-tl-sm"
-                  }`}
-                >
-                  {msg.text}
-                </div>
-              </div>
-            );
-          })}
-          <div ref={chatBottomRef} />
-        </div>
-
-        <form onSubmit={handleSendMessage} className="p-3 border-t border-slate-800 flex items-center gap-2">
-          <input
-            type="text"
-            maxLength={500}
-            value={inputText}
-            onChange={(e) => setInputText(e.target.value)}
-            placeholder="팀원들에게 메시지 보내기..."
-            className="flex-1 bg-slate-950 border border-slate-800 rounded-xl px-3.5 py-2.5 text-xs text-slate-100 focus:outline-none focus:border-indigo-500"
-          />
-          <button type="submit" className="p-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white transition">
-            <Send className="w-4 h-4" />
+          <button
+            type="button"
+            onClick={handleSendChat}
+            className="rounded-lg bg-indigo-600 px-3 hover:bg-indigo-500"
+            aria-label="전송"
+          >
+            <Send size={16} />
           </button>
-        </form>
+        </div>
       </aside>
-    </div>
+    </main>
   );
 }
